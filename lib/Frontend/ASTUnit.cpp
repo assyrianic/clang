@@ -970,9 +970,8 @@ public:
     }
   }
 
-  void HandleMacroDefined(const Token &MacroNameTok,
-                          const MacroDirective *MD) override {
-    AddDefinedMacroToHash(MacroNameTok, Hash);
+  std::unique_ptr<PPCallbacks> createPPCallbacks() override {
+    return llvm::make_unique<MacroDefinitionTrackerPPCallbacks>(Hash);
   }
 
 private:
@@ -2069,6 +2068,7 @@ void ASTUnit::CodeComplete(
   CodeCompleteOpts.IncludeCodePatterns = IncludeCodePatterns;
   CodeCompleteOpts.IncludeGlobals = CachedCompletionResults.empty();
   CodeCompleteOpts.IncludeBriefComments = IncludeBriefComments;
+  CodeCompleteOpts.LoadExternal = Consumer.loadExternal();
 
   assert(IncludeBriefComments == this->IncludeBriefCommentsInCodeCompletion);
 

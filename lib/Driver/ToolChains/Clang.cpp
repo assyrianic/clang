@@ -12,6 +12,7 @@
 #include "Arch/ARM.h"
 #include "Arch/Mips.h"
 #include "Arch/PPC.h"
+#include "Arch/RISCV.h"
 #include "Arch/Sparc.h"
 #include "Arch/SystemZ.h"
 #include "Arch/X86.h"
@@ -274,6 +275,27 @@ static void ParseMRecip(const Driver &D, const ArgList &Args,
   OutStrings.push_back(Args.MakeArgString(Out));
 }
 
+/// The -mprefer-vector-width option accepts either a positive integer
+/// or the string "none".
+static void ParseMPreferVectorWidth(const Driver &D, const ArgList &Args,
+                                    ArgStringList &CmdArgs) {
+  Arg *A = Args.getLastArg(options::OPT_mprefer_vector_width_EQ);
+  if (!A)
+    return;
+
+  StringRef Value = A->getValue();
+  if (Value == "none") {
+    CmdArgs.push_back("-mprefer-vector-width=none");
+  } else {
+    unsigned Width;
+    if (Value.getAsInteger(10, Width)) {
+      D.Diag(diag::err_drv_invalid_value) << A->getOption().getName() << Value;
+      return;
+    }
+    CmdArgs.push_back(Args.MakeArgString("-mprefer-vector-width=" + Value));
+  }
+}
+
 static void getWebAssemblyTargetFeatures(const ArgList &Args,
                                          std::vector<StringRef> &Features) {
   handleTargetFeaturesGroup(Args, Features, options::OPT_m_wasm_Features_Group);
@@ -305,6 +327,10 @@ static void getTargetFeatures(const ToolChain &TC, const llvm::Triple &Triple,
   case llvm::Triple::ppc64:
   case llvm::Triple::ppc64le:
     ppc::getPPCTargetFeatures(D, Triple, Args, Features);
+    break;
+  case llvm::Triple::riscv32:
+  case llvm::Triple::riscv64:
+    riscv::getRISCVTargetFeatures(D, Args, Features);
     break;
   case llvm::Triple::systemz:
     systemz::getSystemZTargetFeatures(Args, Features);
@@ -524,6 +550,14 @@ static bool useFramePointerForTargetByDefault(const ArgList &Args,
     default:
       return true;
     }
+  }
+
+  switch (Triple.getArch()) {
+    case llvm::Triple::riscv32:
+    case llvm::Triple::riscv64:
+      return !areOptimizationsEnabled(Args);
+    default:
+      break;
   }
 
   if (Triple.isOSWindows()) {
@@ -1261,6 +1295,8 @@ static bool isSignedCharDefault(const llvm::Triple &Triple) {
 
   case llvm::Triple::hexagon:
   case llvm::Triple::ppc64le:
+  case llvm::Triple::riscv32:
+  case llvm::Triple::riscv64:
   case llvm::Triple::systemz:
   case llvm::Triple::xcore:
     return false;
@@ -1368,6 +1404,11 @@ void Clang::RenderTargetOptions(const llvm::Triple &EffectiveTriple,
   case llvm::Triple::ppc64:
   case llvm::Triple::ppc64le:
     AddPPCTargetArgs(Args, CmdArgs);
+    break;
+
+  case llvm::Triple::riscv32:
+  case llvm::Triple::riscv64:
+    AddRISCVTargetArgs(Args, CmdArgs);
     break;
 
   case llvm::Triple::sparc:
@@ -1647,6 +1688,25 @@ void Clang::AddPPCTargetArgs(const ArgList &Args,
   }
 }
 
+void Clang::AddRISCVTargetArgs(const ArgList &Args,
+                               ArgStringList &CmdArgs) const {
+  // FIXME: currently defaults to the soft-float ABIs. Will need to be
+  // expanded to select ilp32f, ilp32d, lp64f, lp64d when appropiate.
+  const char *ABIName = nullptr;
+  const llvm::Triple &Triple = getToolChain().getTriple();
+  if (Arg *A = Args.getLastArg(options::OPT_mabi_EQ))
+    ABIName = A->getValue();
+  else if (Triple.getArch() == llvm::Triple::riscv32)
+    ABIName = "ilp32";
+  else if (Triple.getArch() == llvm::Triple::riscv64)
+    ABIName = "lp64";
+  else
+    llvm_unreachable("Unexpected triple!");
+
+  CmdArgs.push_back("-target-abi");
+  CmdArgs.push_back(ABIName);
+}
+
 void Clang::AddSparcTargetArgs(const ArgList &Args,
                                ArgStringList &CmdArgs) const {
   sparc::FloatABI FloatABI =
@@ -1701,6 +1761,9 @@ void Clang::AddX86TargetArgs(const ArgList &Args,
       getToolChain().getDriver().Diag(diag::err_drv_unsupported_option_argument)
           << A->getOption().getName() << Value;
     }
+  } else if (getToolChain().getDriver().IsCLMode()) {
+    CmdArgs.push_back("-mllvm");
+    CmdArgs.push_back("-x86-asm-syntax=intel");
   }
 
   // Set flags to support MCU ABI.
@@ -1717,10 +1780,9 @@ void Clang::AddHexagonTargetArgs(const ArgList &Args,
   CmdArgs.push_back("-Wreturn-type");
 
   if (auto G = toolchains::HexagonToolChain::getSmallDataThreshold(Args)) {
-    std::string N = llvm::utostr(G.getValue());
-    std::string Opt = std::string("-hexagon-small-data-threshold=") + N;
     CmdArgs.push_back("-mllvm");
-    CmdArgs.push_back(Args.MakeArgString(Opt));
+    CmdArgs.push_back(Args.MakeArgString("-hexagon-small-data-threshold=" +
+                                         Twine(G.getValue())));
   }
 
   if (!Args.hasArg(options::OPT_fno_short_enums))
@@ -2148,6 +2210,9 @@ static void RenderFloatingPointOptions(const ToolChain &TC, const Driver &D,
 
   if (!SignedZeros)
     CmdArgs.push_back("-fno-signed-zeros");
+
+  if (AssociativeMath && !SignedZeros && !TrappingMath)
+    CmdArgs.push_back("-mreassociate");
 
   if (ReciprocalMath)
     CmdArgs.push_back("-freciprocal-math");
@@ -3560,7 +3625,11 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       options::OPT_finstrument_function_entry_bare))
     A->render(Args, CmdArgs);
 
-  addPGOAndCoverageFlags(C, D, Output, Args, CmdArgs);
+  // NVPTX doesn't support PGO or coverage. There's no runtime support for
+  // sampling, overhead of call arc collection is way too high and there's no
+  // way to collect the output.
+  if (!Triple.isNVPTX())
+    addPGOAndCoverageFlags(C, D, Output, Args, CmdArgs);
 
   if (auto *ABICompatArg = Args.getLastArg(options::OPT_fclang_abi_compat_EQ))
     ABICompatArg->render(Args, CmdArgs);
@@ -3775,6 +3844,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(A->getValue());
   }
 
+  if (Args.hasFlag(options::OPT_fstack_size_section,
+                   options::OPT_fno_stack_size_section, RawTriple.isPS4()))
+    CmdArgs.push_back("-fstack-size-section");
+
   CmdArgs.push_back("-ferror-limit");
   if (Arg *A = Args.getLastArg(options::OPT_ferror_limit_EQ))
     CmdArgs.push_back(A->getValue());
@@ -3878,6 +3951,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       // semantic analysis, etc.
       break;
     }
+  } else {
+    Args.AddLastArg(CmdArgs, options::OPT_fopenmp_simd,
+                    options::OPT_fno_openmp_simd);
+    Args.AddAllArgs(CmdArgs, options::OPT_fopenmp_version_EQ);
   }
 
   const SanitizerArgs &Sanitize = getToolChain().getSanitizerArgs();
@@ -3976,6 +4053,11 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   // Forward -cl options to -cc1
   RenderOpenCLOptions(Args, CmdArgs);
+
+  if (Arg *A = Args.getLastArg(options::OPT_fcf_protection_EQ)) {
+    CmdArgs.push_back(
+        Args.MakeArgString(Twine("-fcf-protection=") + A->getValue()));
+  }
 
   // Forward -f options with positive and negative forms; we translate
   // these by hand.
@@ -4166,9 +4248,33 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     addExceptionArgs(Args, InputType, getToolChain(), KernelOrKext, Runtime,
                      CmdArgs);
 
-  if (Args.hasArg(options::OPT_fsjlj_exceptions) ||
-      getToolChain().UseSjLjExceptions(Args))
-    CmdArgs.push_back("-fsjlj-exceptions");
+  // Handle exception personalities
+  Arg *A = Args.getLastArg(options::OPT_fsjlj_exceptions,
+                           options::OPT_fseh_exceptions,
+                           options::OPT_fdwarf_exceptions);
+  if (A) {
+    const Option &Opt = A->getOption();
+    if (Opt.matches(options::OPT_fsjlj_exceptions))
+      CmdArgs.push_back("-fsjlj-exceptions");
+    if (Opt.matches(options::OPT_fseh_exceptions))
+      CmdArgs.push_back("-fseh-exceptions");
+    if (Opt.matches(options::OPT_fdwarf_exceptions))
+      CmdArgs.push_back("-fdwarf-exceptions");
+  } else {
+    switch (getToolChain().GetExceptionModel(Args)) {
+    default:
+      break;
+    case llvm::ExceptionHandling::DwarfCFI:
+      CmdArgs.push_back("-fdwarf-exceptions");
+      break;
+    case llvm::ExceptionHandling::SjLj:
+      CmdArgs.push_back("-fsjlj-exceptions");
+      break;
+    case llvm::ExceptionHandling::WinEH:
+      CmdArgs.push_back("-fseh-exceptions");
+      break;
+    }
+  }
 
   // C++ "sane" operator new.
   if (!Args.hasFlag(options::OPT_fassume_sane_operator_new,
@@ -4309,6 +4415,8 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
                    options::OPT_fno_slp_vectorize, EnableSLPVec))
     CmdArgs.push_back("-vectorize-slp");
 
+  ParseMPreferVectorWidth(D, Args, CmdArgs);
+
   if (Arg *A = Args.getLastArg(options::OPT_fshow_overloads_EQ))
     A->render(Args, CmdArgs);
 
@@ -4339,6 +4447,7 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("-fapple-pragma-pack");
 
   if (Args.hasFlag(options::OPT_fsave_optimization_record,
+                   options::OPT_foptimization_record_file_EQ,
                    options::OPT_fno_save_optimization_record, false)) {
     CmdArgs.push_back("-opt-record-file");
 
@@ -4583,6 +4692,37 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
           << "-fwhole-program-vtables"
           << "-flto";
     CmdArgs.push_back("-fwhole-program-vtables");
+  }
+
+  if (Arg *A = Args.getLastArg(options::OPT_fexperimental_isel,
+                               options::OPT_fno_experimental_isel)) {
+    CmdArgs.push_back("-mllvm");
+    if (A->getOption().matches(options::OPT_fexperimental_isel)) {
+      CmdArgs.push_back("-global-isel=1");
+
+      // GISel is on by default on AArch64 -O0, so don't bother adding
+      // the fallback remarks for it. Other combinations will add a warning of
+      // some kind.
+      bool IsArchSupported = Triple.getArch() == llvm::Triple::aarch64;
+      bool IsOptLevelSupported = false;
+
+      Arg *A = Args.getLastArg(options::OPT_O_Group);
+      if (Triple.getArch() == llvm::Triple::aarch64) {
+        if (!A || A->getOption().matches(options::OPT_O0))
+          IsOptLevelSupported = true;
+      }
+      if (!IsArchSupported || !IsOptLevelSupported) {
+        CmdArgs.push_back("-mllvm");
+        CmdArgs.push_back("-global-isel-abort=2");
+
+        if (!IsArchSupported)
+          D.Diag(diag::warn_drv_experimental_isel_incomplete) << Triple.getArchName();
+        else
+          D.Diag(diag::warn_drv_experimental_isel_incomplete_opt);
+      }
+    } else {
+      CmdArgs.push_back("-global-isel=0");
+    }
   }
 
   // Finally add the compile command to the compilation.
@@ -5016,6 +5156,10 @@ void Clang::AddClangCLArgs(const ArgList &Args, types::ID InputType,
     else
       CmdArgs.push_back("msvc");
   }
+
+  if (Args.hasArg(options::OPT__SLASH_Guard) &&
+      Args.getLastArgValue(options::OPT__SLASH_Guard).equals_lower("cf"))
+    CmdArgs.push_back("-cfguard");
 }
 
 visualstudio::Compiler *Clang::getCLFallback() const {

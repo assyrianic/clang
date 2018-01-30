@@ -102,24 +102,55 @@ static llvm::Optional<StringRef> getRawStringDelimiter(StringRef TokenText) {
   return Delimiter;
 }
 
+// Returns the canonical delimiter for \p Language, or the empty string if no
+// canonical delimiter is specified.
+static StringRef
+getCanonicalRawStringDelimiter(const FormatStyle &Style,
+                               FormatStyle::LanguageKind Language) {
+  for (const auto &Format : Style.RawStringFormats) {
+    if (Format.Language == Language)
+      return StringRef(Format.CanonicalDelimiter);
+  }
+  return "";
+}
+
 RawStringFormatStyleManager::RawStringFormatStyleManager(
     const FormatStyle &CodeStyle) {
   for (const auto &RawStringFormat : CodeStyle.RawStringFormats) {
-    FormatStyle Style;
-    if (!getPredefinedStyle(RawStringFormat.BasedOnStyle,
-                            RawStringFormat.Language, &Style)) {
-      Style = getLLVMStyle();
-      Style.Language = RawStringFormat.Language;
+    llvm::Optional<FormatStyle> LanguageStyle =
+        CodeStyle.GetLanguageStyle(RawStringFormat.Language);
+    if (!LanguageStyle) {
+      FormatStyle PredefinedStyle;
+      if (!getPredefinedStyle(RawStringFormat.BasedOnStyle,
+                              RawStringFormat.Language, &PredefinedStyle)) {
+        PredefinedStyle = getLLVMStyle();
+        PredefinedStyle.Language = RawStringFormat.Language;
+      }
+      LanguageStyle = PredefinedStyle;
     }
-    Style.ColumnLimit = CodeStyle.ColumnLimit;
-    DelimiterStyle.insert({RawStringFormat.Delimiter, Style});
+    LanguageStyle->ColumnLimit = CodeStyle.ColumnLimit;
+    for (StringRef Delimiter : RawStringFormat.Delimiters) {
+      DelimiterStyle.insert({Delimiter, *LanguageStyle});
+    }
+    for (StringRef EnclosingFunction : RawStringFormat.EnclosingFunctions) {
+      EnclosingFunctionStyle.insert({EnclosingFunction, *LanguageStyle});
+    }
   }
 }
 
 llvm::Optional<FormatStyle>
-RawStringFormatStyleManager::get(StringRef Delimiter) const {
+RawStringFormatStyleManager::getDelimiterStyle(StringRef Delimiter) const {
   auto It = DelimiterStyle.find(Delimiter);
   if (It == DelimiterStyle.end())
+    return None;
+  return It->second;
+}
+
+llvm::Optional<FormatStyle>
+RawStringFormatStyleManager::getEnclosingFunctionStyle(
+    StringRef EnclosingFunction) const {
+  auto It = EnclosingFunctionStyle.find(EnclosingFunction);
+  if (It == EnclosingFunctionStyle.end())
     return None;
   return It->second;
 }
@@ -323,7 +354,8 @@ bool ContinuationIndenter::mustBreak(const LineState &State) {
     // We need special cases for ">>" which we have split into two ">" while
     // lexing in order to make template parsing easier.
     bool IsComparison = (Previous.getPrecedence() == prec::Relational ||
-                         Previous.getPrecedence() == prec::Equality) &&
+                         Previous.getPrecedence() == prec::Equality ||
+                         Previous.getPrecedence() == prec::Spaceship) &&
                         Previous.Previous &&
                         Previous.Previous->isNot(TT_BinaryOperator); // For >>.
     bool LHSIsBinaryExpr =
@@ -536,7 +568,8 @@ void ContinuationIndenter::addTokenOnCurrentLine(LineState &State, bool DryRun,
        (P->is(TT_ConditionalExpr) && P->is(tok::colon))) &&
       !P->isOneOf(TT_OverloadedOperator, TT_CtorInitializerComma) &&
       P->getPrecedence() != prec::Assignment &&
-      P->getPrecedence() != prec::Relational) {
+      P->getPrecedence() != prec::Relational &&
+      P->getPrecedence() != prec::Spaceship) {
     bool BreakBeforeOperator =
         P->MustBreakBefore || P->is(tok::lessless) ||
         (P->is(TT_BinaryOperator) &&
@@ -1291,14 +1324,32 @@ unsigned ContinuationIndenter::reformatRawStringLiteral(
     const FormatToken &Current, LineState &State,
     const FormatStyle &RawStringStyle, bool DryRun) {
   unsigned StartColumn = State.Column - Current.ColumnWidth;
-  auto Delimiter = *getRawStringDelimiter(Current.TokenText);
+  StringRef OldDelimiter = *getRawStringDelimiter(Current.TokenText);
+  StringRef NewDelimiter =
+      getCanonicalRawStringDelimiter(Style, RawStringStyle.Language);
+  if (NewDelimiter.empty() || OldDelimiter.empty())
+    NewDelimiter = OldDelimiter;
   // The text of a raw string is between the leading 'R"delimiter(' and the
   // trailing 'delimiter)"'.
-  unsigned PrefixSize = 3 + Delimiter.size();
-  unsigned SuffixSize = 2 + Delimiter.size();
+  unsigned OldPrefixSize = 3 + OldDelimiter.size();
+  unsigned OldSuffixSize = 2 + OldDelimiter.size();
+  // We create a virtual text environment which expects a null-terminated
+  // string, so we cannot use StringRef.
+  std::string RawText =
+      Current.TokenText.substr(OldPrefixSize).drop_back(OldSuffixSize);
+  if (NewDelimiter != OldDelimiter) {
+    // Don't update to the canonical delimiter 'deli' if ')deli"' occurs in the
+    // raw string.
+    std::string CanonicalDelimiterSuffix = (")" + NewDelimiter + "\"").str();
+    if (StringRef(RawText).contains(CanonicalDelimiterSuffix))
+      NewDelimiter = OldDelimiter;
+  }
 
-  // The first start column is the column the raw text starts.
-  unsigned FirstStartColumn = StartColumn + PrefixSize;
+  unsigned NewPrefixSize = 3 + NewDelimiter.size();
+  unsigned NewSuffixSize = 2 + NewDelimiter.size();
+
+  // The first start column is the column the raw text starts after formatting.
+  unsigned FirstStartColumn = StartColumn + NewPrefixSize;
 
   // The next start column is the intended indentation a line break inside
   // the raw string at level 0. It is determined by the following rules:
@@ -1309,7 +1360,7 @@ unsigned ContinuationIndenter::reformatRawStringLiteral(
   // These rules have the advantage that the formatted content both does not
   // violate the rectangle rule and visually flows within the surrounding
   // source.
-  bool ContentStartsOnNewline = Current.TokenText[PrefixSize] == '\n';
+  bool ContentStartsOnNewline = Current.TokenText[OldPrefixSize] == '\n';
   unsigned NextStartColumn = ContentStartsOnNewline
                                  ? State.Stack.back().Indent + Style.IndentWidth
                                  : FirstStartColumn;
@@ -1323,11 +1374,8 @@ unsigned ContinuationIndenter::reformatRawStringLiteral(
   //   - if the raw string prefix does not start on a newline, it is the current
   //     indent.
   unsigned LastStartColumn = Current.NewlinesBefore
-                                 ? FirstStartColumn - PrefixSize
+                                 ? FirstStartColumn - NewPrefixSize
                                  : State.Stack.back().Indent;
-
-  std::string RawText =
-      Current.TokenText.substr(PrefixSize).drop_back(SuffixSize);
 
   std::pair<tooling::Replacements, unsigned> Fixes = internal::reformat(
       RawStringStyle, RawText, {tooling::Range(0, RawText.size())},
@@ -1341,8 +1389,33 @@ unsigned ContinuationIndenter::reformatRawStringLiteral(
     return 0;
   }
   if (!DryRun) {
+    if (NewDelimiter != OldDelimiter) {
+      // In 'R"delimiter(...', the delimiter starts 2 characters after the start
+      // of the token.
+      SourceLocation PrefixDelimiterStart =
+          Current.Tok.getLocation().getLocWithOffset(2);
+      auto PrefixErr = Whitespaces.addReplacement(tooling::Replacement(
+          SourceMgr, PrefixDelimiterStart, OldDelimiter.size(), NewDelimiter));
+      if (PrefixErr) {
+        llvm::errs()
+            << "Failed to update the prefix delimiter of a raw string: "
+            << llvm::toString(std::move(PrefixErr)) << "\n";
+      }
+      // In 'R"delimiter(...)delimiter"', the suffix delimiter starts at
+      // position length - 1 - |delimiter|.
+      SourceLocation SuffixDelimiterStart =
+          Current.Tok.getLocation().getLocWithOffset(Current.TokenText.size() -
+                                                     1 - OldDelimiter.size());
+      auto SuffixErr = Whitespaces.addReplacement(tooling::Replacement(
+          SourceMgr, SuffixDelimiterStart, OldDelimiter.size(), NewDelimiter));
+      if (SuffixErr) {
+        llvm::errs()
+            << "Failed to update the suffix delimiter of a raw string: "
+            << llvm::toString(std::move(SuffixErr)) << "\n";
+      }
+    }
     SourceLocation OriginLoc =
-        Current.Tok.getLocation().getLocWithOffset(PrefixSize);
+        Current.Tok.getLocation().getLocWithOffset(OldPrefixSize);
     for (const tooling::Replacement &Fix : Fixes.first) {
       auto Err = Whitespaces.addReplacement(tooling::Replacement(
           SourceMgr, OriginLoc.getLocWithOffset(Fix.getOffset()),
@@ -1355,7 +1428,7 @@ unsigned ContinuationIndenter::reformatRawStringLiteral(
   }
   unsigned RawLastLineEndColumn = getLastLineEndColumn(
       *NewCode, FirstStartColumn, Style.TabWidth, Encoding);
-  State.Column = RawLastLineEndColumn + SuffixSize;
+  State.Column = RawLastLineEndColumn + NewSuffixSize;
   return Fixes.second;
 }
 
@@ -1390,13 +1463,62 @@ unsigned ContinuationIndenter::handleEndOfLine(const FormatToken &Current,
     Penalty = addMultilineToken(Current, State);
   } else if (State.Line->Type != LT_ImportStatement) {
     // We generally don't break import statements.
-    Penalty = breakProtrudingToken(Current, State, AllowBreak, DryRun);
+    LineState OriginalState = State;
+
+    // Whether we force the reflowing algorithm to stay strictly within the
+    // column limit.
+    bool Strict = false;
+    // Whether the first non-strict attempt at reflowing did intentionally
+    // exceed the column limit.
+    bool Exceeded = false;
+    std::tie(Penalty, Exceeded) = breakProtrudingToken(
+        Current, State, AllowBreak, /*DryRun=*/true, Strict);
+    if (Exceeded) {
+      // If non-strict reflowing exceeds the column limit, try whether strict
+      // reflowing leads to an overall lower penalty.
+      LineState StrictState = OriginalState;
+      unsigned StrictPenalty =
+          breakProtrudingToken(Current, StrictState, AllowBreak,
+                               /*DryRun=*/true, /*Strict=*/true)
+              .first;
+      Strict = StrictPenalty <= Penalty;
+      if (Strict) {
+        Penalty = StrictPenalty;
+        State = StrictState;
+      }
+    }
+    if (!DryRun) {
+      // If we're not in dry-run mode, apply the changes with the decision on
+      // strictness made above.
+      breakProtrudingToken(Current, OriginalState, AllowBreak, /*DryRun=*/false,
+                           Strict);
+    }
   }
   if (State.Column > getColumnLimit(State)) {
     unsigned ExcessCharacters = State.Column - getColumnLimit(State);
     Penalty += Style.PenaltyExcessCharacter * ExcessCharacters;
   }
   return Penalty;
+}
+
+// Returns the enclosing function name of a token, or the empty string if not
+// found.
+static StringRef getEnclosingFunctionName(const FormatToken &Current) {
+  // Look for: 'function(' or 'function<templates>(' before Current.
+  auto Tok = Current.getPreviousNonComment();
+  if (!Tok || !Tok->is(tok::l_paren))
+    return "";
+  Tok = Tok->getPreviousNonComment();
+  if (!Tok)
+    return "";
+  if (Tok->is(TT_TemplateCloser)) {
+    Tok = Tok->MatchingParen;
+    if (Tok)
+      Tok = Tok->getPreviousNonComment();
+  }
+  if (!Tok || !Tok->is(tok::identifier))
+    return "";
+  return Tok->TokenText;
 }
 
 llvm::Optional<FormatStyle>
@@ -1407,7 +1529,10 @@ ContinuationIndenter::getRawStringStyle(const FormatToken &Current,
   auto Delimiter = getRawStringDelimiter(Current.TokenText);
   if (!Delimiter)
     return None;
-  auto RawStringStyle = RawStringFormats.get(*Delimiter);
+  auto RawStringStyle = RawStringFormats.getDelimiterStyle(*Delimiter);
+  if (!RawStringStyle)
+    RawStringStyle = RawStringFormats.getEnclosingFunctionStyle(
+        getEnclosingFunctionName(Current));
   if (!RawStringStyle)
     return None;
   RawStringStyle->ColumnLimit = getColumnLimit(State);
@@ -1451,9 +1576,16 @@ std::unique_ptr<BreakableToken> ContinuationIndenter::createBreakableToken(
           Text.startswith(Prefix = "u8\"") ||
           Text.startswith(Prefix = "L\""))) ||
         (Text.startswith(Prefix = "_T(\"") && Text.endswith(Postfix = "\")"))) {
+      // We need this to address the case where there is an unbreakable tail
+      // only if certain other formatting decisions have been taken. The
+      // UnbreakableTailLength of Current is an overapproximation is that case
+      // and we need to be correct here.
+      unsigned UnbreakableTailLength = (State.NextToken && canBreak(State))
+                                           ? 0
+                                           : Current.UnbreakableTailLength;
       return llvm::make_unique<BreakableStringLiteral>(
-          Current, StartColumn, Prefix, Postfix, State.Line->InPPDirective,
-          Encoding, Style);
+          Current, StartColumn, Prefix, Postfix, UnbreakableTailLength,
+          State.Line->InPPDirective, Encoding, Style);
     }
   } else if (Current.is(TT_BlockComment)) {
     if (!Style.ReflowComments ||
@@ -1480,27 +1612,32 @@ std::unique_ptr<BreakableToken> ContinuationIndenter::createBreakableToken(
   return nullptr;
 }
 
-unsigned ContinuationIndenter::breakProtrudingToken(const FormatToken &Current,
-                                                    LineState &State,
-                                                    bool AllowBreak,
-                                                    bool DryRun) {
-  std::unique_ptr<BreakableToken> Token =
+std::pair<unsigned, bool>
+ContinuationIndenter::breakProtrudingToken(const FormatToken &Current,
+                                           LineState &State, bool AllowBreak,
+                                           bool DryRun, bool Strict) {
+  std::unique_ptr<const BreakableToken> Token =
       createBreakableToken(Current, State, AllowBreak);
   if (!Token)
-    return 0;
+    return {0, false};
+  assert(Token->getLineCount() > 0);
   unsigned ColumnLimit = getColumnLimit(State);
-  unsigned StartColumn = State.Column - Current.ColumnWidth;
   if (Current.is(TT_LineComment)) {
     // We don't insert backslashes when breaking line comments.
     ColumnLimit = Style.ColumnLimit;
   }
   if (Current.UnbreakableTailLength >= ColumnLimit)
-    return 0;
-
+    return {0, false};
+  // ColumnWidth was already accounted into State.Column before calling
+  // breakProtrudingToken.
+  unsigned StartColumn = State.Column - Current.ColumnWidth;
   unsigned NewBreakPenalty = Current.isStringLiteral()
                                  ? Style.PenaltyBreakString
                                  : Style.PenaltyBreakComment;
-  unsigned RemainingSpace = ColumnLimit - Current.UnbreakableTailLength;
+  // Stores whether we intentionally decide to let a line exceed the column
+  // limit.
+  bool Exceeded = false;
+  // Stores whether we introduce a break anywhere in the token.
   bool BreakInserted = Token->introducesBreakBeforeToken();
   // Store whether we inserted a new line break at the end of the previous
   // logical line.
@@ -1508,145 +1645,297 @@ unsigned ContinuationIndenter::breakProtrudingToken(const FormatToken &Current,
   // We use a conservative reflowing strategy. Reflow starts after a line is
   // broken or the corresponding whitespace compressed. Reflow ends as soon as a
   // line that doesn't get reflown with the previous line is reached.
-  bool ReflowInProgress = false;
-  unsigned Penalty = 0;
-  unsigned RemainingTokenColumns = 0;
+  bool Reflow = false;
+  // Keep track of where we are in the token:
+  // Where we are in the content of the current logical line.
   unsigned TailOffset = 0;
+  // The column number we're currently at.
+  unsigned ContentStartColumn =
+      Token->getContentStartColumn(0, /*Break=*/false);
+  // The number of columns left in the current logical line after TailOffset.
+  unsigned RemainingTokenColumns =
+      Token->getRemainingLength(0, TailOffset, ContentStartColumn);
+  // Adapt the start of the token, for example indent.
+  if (!DryRun)
+    Token->adaptStartOfLine(0, Whitespaces);
+
+  unsigned Penalty = 0;
   DEBUG(llvm::dbgs() << "Breaking protruding token at column " << StartColumn
                      << ".\n");
   for (unsigned LineIndex = 0, EndIndex = Token->getLineCount();
        LineIndex != EndIndex; ++LineIndex) {
-    DEBUG(llvm::dbgs() << "  Line: " << LineIndex
-                       << " (Reflow: " << ReflowInProgress << ")\n");
-    BreakableToken::Split SplitBefore(StringRef::npos, 0);
-    if (ReflowInProgress) {
-      SplitBefore = Token->getSplitBefore(LineIndex, RemainingTokenColumns,
-                                          RemainingSpace, CommentPragmasRegex);
-    }
-    ReflowInProgress = SplitBefore.first != StringRef::npos;
-    DEBUG({
-      if (ReflowInProgress)
-        llvm::dbgs() << "  Reflowing.\n";
-    });
-    TailOffset =
-        ReflowInProgress ? (SplitBefore.first + SplitBefore.second) : 0;
-    // If we found a reflow split and have added a new break before this line,
-    // we are going to remove the line break at the start of the next logical
-    // line.
-    // For example, here we'll add a new line break after 'text', and
-    // subsequently delete the line break between 'that' and 'reflows'.
-    //   // some text that
-    //   // reflows
-    // ->
-    //   // some text
-    //   // that reflows
-    // When adding the line break, we also added the penalty for it, so we need
-    // to subtract that penalty again when we remove the line break due to
-    // reflowing.
-    if (ReflowInProgress && NewBreakBefore) {
-      assert(Penalty >= NewBreakPenalty);
-      Penalty -= NewBreakPenalty;
-    }
+    DEBUG(llvm::dbgs() << "  Line: " << LineIndex << " (Reflow: " << Reflow
+                       << ")\n");
     NewBreakBefore = false;
-    if (!DryRun)
-      Token->replaceWhitespaceBefore(LineIndex, RemainingTokenColumns,
-                                     RemainingSpace, SplitBefore, Whitespaces);
-    RemainingTokenColumns = Token->getLineLengthAfterSplitBefore(
-        LineIndex, TailOffset, RemainingTokenColumns, ColumnLimit, SplitBefore);
-    while (RemainingTokenColumns > RemainingSpace) {
-      DEBUG(llvm::dbgs() << "    Over limit, need: " << RemainingTokenColumns
-                         << ", space: " << RemainingSpace << "\n");
-      BreakableToken::Split Split = Token->getSplit(
-          LineIndex, TailOffset, ColumnLimit, CommentPragmasRegex);
+    // If we did reflow the previous line, we'll try reflowing again. Otherwise
+    // we'll start reflowing if the current line is broken or whitespace is
+    // compressed.
+    bool TryReflow = Reflow;
+    // Break the current token until we can fit the rest of the line.
+    while (ContentStartColumn + RemainingTokenColumns > ColumnLimit) {
+      DEBUG(llvm::dbgs() << "    Over limit, need: "
+                         << (ContentStartColumn + RemainingTokenColumns)
+                         << ", space: " << ColumnLimit
+                         << ", reflown prefix: " << ContentStartColumn
+                         << ", offset in line: " << TailOffset << "\n");
+      // If the current token doesn't fit, find the latest possible split in the
+      // current line so that breaking at it will be under the column limit.
+      // FIXME: Use the earliest possible split while reflowing to correctly
+      // compress whitespace within a line.
+      BreakableToken::Split Split =
+          Token->getSplit(LineIndex, TailOffset, ColumnLimit,
+                          ContentStartColumn, CommentPragmasRegex);
       if (Split.first == StringRef::npos) {
-        // The last line's penalty is handled in addNextStateToQueue().
+        // No break opportunity - update the penalty and continue with the next
+        // logical line.
         if (LineIndex < EndIndex - 1)
+          // The last line's penalty is handled in addNextStateToQueue().
           Penalty += Style.PenaltyExcessCharacter *
-                     (RemainingTokenColumns - RemainingSpace);
+                     (ContentStartColumn + RemainingTokenColumns - ColumnLimit);
         DEBUG(llvm::dbgs() << "    No break opportunity.\n");
         break;
       }
       assert(Split.first != 0);
 
-      // Check if compressing the whitespace range will bring the line length
-      // under the limit. If that is the case, we perform whitespace compression
-      // instead of inserting a line break.
-      unsigned RemainingTokenColumnsAfterCompression =
-          Token->getLineLengthAfterCompression(RemainingTokenColumns, Split);
-      if (RemainingTokenColumnsAfterCompression <= RemainingSpace) {
-        RemainingTokenColumns = RemainingTokenColumnsAfterCompression;
-        ReflowInProgress = true;
-        if (!DryRun)
-          Token->compressWhitespace(LineIndex, TailOffset, Split, Whitespaces);
-        DEBUG(llvm::dbgs() << "    Compressing below limit.\n");
-        break;
+      if (Token->supportsReflow()) {
+        // Check whether the next natural split point after the current one can
+        // still fit the line, either because we can compress away whitespace,
+        // or because the penalty the excess characters introduce is lower than
+        // the break penalty.
+        // We only do this for tokens that support reflowing, and thus allow us
+        // to change the whitespace arbitrarily (e.g. comments).
+        // Other tokens, like string literals, can be broken on arbitrary
+        // positions.
+
+        // First, compute the columns from TailOffset to the next possible split
+        // position.
+        // For example:
+        // ColumnLimit:     |
+        // // Some text   that    breaks
+        //    ^ tail offset
+        //             ^-- split
+        //    ^-------- to split columns
+        //                    ^--- next split
+        //    ^--------------- to next split columns
+        unsigned ToSplitColumns = Token->getRangeLength(
+            LineIndex, TailOffset, Split.first, ContentStartColumn);
+        DEBUG(llvm::dbgs() << "    ToSplit: " << ToSplitColumns << "\n");
+
+        BreakableToken::Split NextSplit = Token->getSplit(
+            LineIndex, TailOffset + Split.first + Split.second, ColumnLimit,
+            ContentStartColumn + ToSplitColumns + 1, CommentPragmasRegex);
+        // Compute the columns necessary to fit the next non-breakable sequence
+        // into the current line.
+        unsigned ToNextSplitColumns = 0;
+        if (NextSplit.first == StringRef::npos) {
+          ToNextSplitColumns = Token->getRemainingLength(LineIndex, TailOffset,
+                                                         ContentStartColumn);
+        } else {
+          ToNextSplitColumns = Token->getRangeLength(
+              LineIndex, TailOffset,
+              Split.first + Split.second + NextSplit.first, ContentStartColumn);
+        }
+        // Compress the whitespace between the break and the start of the next
+        // unbreakable sequence.
+        ToNextSplitColumns =
+            Token->getLengthAfterCompression(ToNextSplitColumns, Split);
+        DEBUG(llvm::dbgs() << "    ContentStartColumn: " << ContentStartColumn
+                           << "\n");
+        DEBUG(llvm::dbgs() << "    ToNextSplit: " << ToNextSplitColumns << "\n");
+        // If the whitespace compression makes us fit, continue on the current
+        // line.
+        bool ContinueOnLine =
+            ContentStartColumn + ToNextSplitColumns <= ColumnLimit;
+        unsigned ExcessCharactersPenalty = 0;
+        if (!ContinueOnLine && !Strict) {
+          // Similarly, if the excess characters' penalty is lower than the
+          // penalty of introducing a new break, continue on the current line.
+          ExcessCharactersPenalty =
+              (ContentStartColumn + ToNextSplitColumns - ColumnLimit) *
+              Style.PenaltyExcessCharacter;
+          DEBUG(llvm::dbgs()
+                << "    Penalty excess: " << ExcessCharactersPenalty
+                << "\n            break : " << NewBreakPenalty << "\n");
+          if (ExcessCharactersPenalty < NewBreakPenalty) {
+            Exceeded = true;
+            ContinueOnLine = true;
+          }
+        }
+        if (ContinueOnLine) {
+          DEBUG(llvm::dbgs() << "    Continuing on line...\n");
+          // The current line fits after compressing the whitespace - reflow
+          // the next line into it if possible.
+          TryReflow = true;
+          if (!DryRun)
+            Token->compressWhitespace(LineIndex, TailOffset, Split,
+                                      Whitespaces);
+          // When we continue on the same line, leave one space between content.
+          ContentStartColumn += ToSplitColumns + 1;
+          Penalty += ExcessCharactersPenalty;
+          TailOffset += Split.first + Split.second;
+          RemainingTokenColumns = Token->getRemainingLength(
+              LineIndex, TailOffset, ContentStartColumn);
+          continue;
+        }
       }
-
-      // Compute both the penalties for:
-      // - not breaking, and leaving excess characters
-      // - adding a new line break
-      assert(RemainingTokenColumnsAfterCompression > RemainingSpace);
-      unsigned ExcessCharactersPenalty =
-          (RemainingTokenColumnsAfterCompression - RemainingSpace) *
-          Style.PenaltyExcessCharacter;
-
-      unsigned BreakPenalty = NewBreakPenalty;
-      unsigned ColumnsUsed =
-          Token->getLineLengthAfterSplit(LineIndex, TailOffset, Split.first);
-      if (ColumnsUsed > ColumnLimit)
-        BreakPenalty +=
-            Style.PenaltyExcessCharacter * (ColumnsUsed - ColumnLimit);
-
-      DEBUG(llvm::dbgs() << "    Penalty excess: " << ExcessCharactersPenalty
-                         << "\n            break : " << BreakPenalty << "\n");
-      // Only continue to add the line break if the penalty of the excess
-      // characters is larger than the penalty of the line break.
-      // FIXME: This does not take into account when we can later remove the
-      // line break again due to a reflow.
-      if (ExcessCharactersPenalty < BreakPenalty) {
-        if (!DryRun)
-          Token->compressWhitespace(LineIndex, TailOffset, Split, Whitespaces);
-        // Do not set ReflowInProgress: we do not have any space left to
-        // reflow into.
-        Penalty += ExcessCharactersPenalty;
-        break;
-      }
-
-      unsigned NewRemainingTokenColumns = Token->getLineLengthAfterSplit(
-          LineIndex, TailOffset + Split.first + Split.second, StringRef::npos);
+      DEBUG(llvm::dbgs() << "    Breaking...\n");
+      ContentStartColumn =
+          Token->getContentStartColumn(LineIndex, /*Break=*/true);
+      unsigned NewRemainingTokenColumns = Token->getRemainingLength(
+          LineIndex, TailOffset + Split.first + Split.second,
+          ContentStartColumn);
 
       // When breaking before a tab character, it may be moved by a few columns,
       // but will still be expanded to the next tab stop, so we don't save any
       // columns.
-      if (NewRemainingTokenColumns == RemainingTokenColumns)
+      if (NewRemainingTokenColumns == RemainingTokenColumns) {
         // FIXME: Do we need to adjust the penalty?
         break;
+      }
       assert(NewRemainingTokenColumns < RemainingTokenColumns);
 
+      DEBUG(llvm::dbgs() << "    Breaking at: " << TailOffset + Split.first
+                         << ", " << Split.second << "\n");
       if (!DryRun)
         Token->insertBreak(LineIndex, TailOffset, Split, Whitespaces);
 
-      Penalty += BreakPenalty;
+      Penalty += NewBreakPenalty;
       TailOffset += Split.first + Split.second;
       RemainingTokenColumns = NewRemainingTokenColumns;
-      ReflowInProgress = true;
       BreakInserted = true;
       NewBreakBefore = true;
+    }
+    // In case there's another line, prepare the state for the start of the next
+    // line.
+    if (LineIndex + 1 != EndIndex) {
+      unsigned NextLineIndex = LineIndex + 1;
+      if (NewBreakBefore)
+        // After breaking a line, try to reflow the next line into the current
+        // one once RemainingTokenColumns fits.
+        TryReflow = true;
+      if (TryReflow) {
+        // We decided that we want to try reflowing the next line into the
+        // current one.
+        // We will now adjust the state as if the reflow is successful (in
+        // preparation for the next line), and see whether that works. If we
+        // decide that we cannot reflow, we will later reset the state to the
+        // start of the next line.
+        Reflow = false;
+        // As we did not continue breaking the line, RemainingTokenColumns is
+        // known to fit after ContentStartColumn. Adapt ContentStartColumn to
+        // the position at which we want to format the next line if we do
+        // actually reflow.
+        // When we reflow, we need to add a space between the end of the current
+        // line and the next line's start column.
+        ContentStartColumn += RemainingTokenColumns + 1;
+        // Get the split that we need to reflow next logical line into the end
+        // of the current one; the split will include any leading whitespace of
+        // the next logical line.
+        BreakableToken::Split SplitBeforeNext =
+            Token->getReflowSplit(NextLineIndex, CommentPragmasRegex);
+        DEBUG(llvm::dbgs() << "    Size of reflown text: " << ContentStartColumn
+                           << "\n    Potential reflow split: ");
+        if (SplitBeforeNext.first != StringRef::npos) {
+          DEBUG(llvm::dbgs() << SplitBeforeNext.first << ", "
+                             << SplitBeforeNext.second << "\n");
+          TailOffset = SplitBeforeNext.first + SplitBeforeNext.second;
+          // If the rest of the next line fits into the current line below the
+          // column limit, we can safely reflow.
+          RemainingTokenColumns = Token->getRemainingLength(
+              NextLineIndex, TailOffset, ContentStartColumn);
+          Reflow = true;
+          if (ContentStartColumn + RemainingTokenColumns > ColumnLimit) {
+            DEBUG(llvm::dbgs() << "    Over limit after reflow, need: "
+                               << (ContentStartColumn + RemainingTokenColumns)
+                               << ", space: " << ColumnLimit
+                               << ", reflown prefix: " << ContentStartColumn
+                               << ", offset in line: " << TailOffset << "\n");
+            // If the whole next line does not fit, try to find a point in
+            // the next line at which we can break so that attaching the part
+            // of the next line to that break point onto the current line is
+            // below the column limit.
+            BreakableToken::Split Split =
+                Token->getSplit(NextLineIndex, TailOffset, ColumnLimit,
+                                ContentStartColumn, CommentPragmasRegex);
+            if (Split.first == StringRef::npos) {
+              DEBUG(llvm::dbgs() << "    Did not find later break\n");
+              Reflow = false;
+            } else {
+              // Check whether the first split point gets us below the column
+              // limit. Note that we will execute this split below as part of
+              // the normal token breaking and reflow logic within the line.
+              unsigned ToSplitColumns = Token->getRangeLength(
+                  NextLineIndex, TailOffset, Split.first, ContentStartColumn);
+              if (ContentStartColumn + ToSplitColumns > ColumnLimit) {
+                DEBUG(llvm::dbgs() << "    Next split protrudes, need: "
+                                   << (ContentStartColumn + ToSplitColumns)
+                                   << ", space: " << ColumnLimit);
+                unsigned ExcessCharactersPenalty =
+                    (ContentStartColumn + ToSplitColumns - ColumnLimit) *
+                    Style.PenaltyExcessCharacter;
+                if (NewBreakPenalty < ExcessCharactersPenalty) {
+                  Reflow = false;
+                }
+              }
+            }
+          }
+        } else {
+          DEBUG(llvm::dbgs() << "not found.\n");
+        }
+      }
+      if (!Reflow) {
+        // If we didn't reflow into the next line, the only space to consider is
+        // the next logical line. Reset our state to match the start of the next
+        // line.
+        TailOffset = 0;
+        ContentStartColumn =
+            Token->getContentStartColumn(NextLineIndex, /*Break=*/false);
+        RemainingTokenColumns = Token->getRemainingLength(
+            NextLineIndex, TailOffset, ContentStartColumn);
+        // Adapt the start of the token, for example indent.
+        if (!DryRun)
+          Token->adaptStartOfLine(NextLineIndex, Whitespaces);
+      } else {
+        // If we found a reflow split and have added a new break before the next
+        // line, we are going to remove the line break at the start of the next
+        // logical line. For example, here we'll add a new line break after
+        // 'text', and subsequently delete the line break between 'that' and
+        // 'reflows'.
+        //   // some text that
+        //   // reflows
+        // ->
+        //   // some text
+        //   // that reflows
+        // When adding the line break, we also added the penalty for it, so we
+        // need to subtract that penalty again when we remove the line break due
+        // to reflowing.
+        if (NewBreakBefore) {
+          assert(Penalty >= NewBreakPenalty);
+          Penalty -= NewBreakPenalty;
+        }
+        if (!DryRun)
+          Token->reflow(NextLineIndex, Whitespaces);
+      }
     }
   }
 
   BreakableToken::Split SplitAfterLastLine =
-      Token->getSplitAfterLastLine(TailOffset, ColumnLimit);
+      Token->getSplitAfterLastLine(TailOffset);
   if (SplitAfterLastLine.first != StringRef::npos) {
     DEBUG(llvm::dbgs() << "Replacing whitespace after last line.\n");
     if (!DryRun)
       Token->replaceWhitespaceAfterLastLine(TailOffset, SplitAfterLastLine,
                                             Whitespaces);
-    RemainingTokenColumns = Token->getLineLengthAfterSplitAfterLastLine(
-        TailOffset, SplitAfterLastLine);
+    ContentStartColumn =
+        Token->getContentStartColumn(Token->getLineCount() - 1, /*Break=*/true);
+    RemainingTokenColumns = Token->getRemainingLength(
+        Token->getLineCount() - 1,
+        TailOffset + SplitAfterLastLine.first + SplitAfterLastLine.second,
+        ContentStartColumn);
   }
 
-  State.Column = RemainingTokenColumns;
+  State.Column = ContentStartColumn + RemainingTokenColumns -
+                 Current.UnbreakableTailLength;
 
   if (BreakInserted) {
     // If we break the token inside a parameter list, we need to break before
@@ -1665,7 +1954,7 @@ unsigned ContinuationIndenter::breakProtrudingToken(const FormatToken &Current,
 
   Token->updateNextToken(State);
 
-  return Penalty;
+  return {Penalty, Exceeded};
 }
 
 unsigned ContinuationIndenter::getColumnLimit(const LineState &State) const {

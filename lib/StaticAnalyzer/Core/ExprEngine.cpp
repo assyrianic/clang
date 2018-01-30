@@ -63,6 +63,21 @@ typedef std::pair<const CXXBindTemporaryExpr *, const StackFrameContext *>
 REGISTER_TRAIT_WITH_PROGRAMSTATE(InitializedTemporariesSet,
                                  llvm::ImmutableSet<CXXBindTemporaryContext>)
 
+typedef llvm::ImmutableMap<std::pair<const CXXNewExpr *,
+                           const LocationContext *>, SVal>
+    CXXNewAllocatorValuesMap;
+
+// Keeps track of return values of various operator new() calls between
+// evaluation of the inlined operator new(), through the constructor call,
+// to the actual evaluation of the CXXNewExpr.
+// TODO: Refactor the key for this trait into a LocationContext sub-class,
+// which would be put on the stack of location contexts before operator new()
+// is evaluated, and removed from the stack when the whole CXXNewExpr
+// is fully evaluated.
+// Probably do something similar to the previous trait as well.
+REGISTER_TRAIT_WITH_PROGRAMSTATE(CXXNewAllocatorValues,
+                                 CXXNewAllocatorValuesMap)
+
 //===----------------------------------------------------------------------===//
 // Engine construction and deletion.
 //===----------------------------------------------------------------------===//
@@ -308,6 +323,43 @@ ExprEngine::createTemporaryRegionIfNeeded(ProgramStateRef State,
   return State;
 }
 
+ProgramStateRef
+ExprEngine::setCXXNewAllocatorValue(ProgramStateRef State,
+                                    const CXXNewExpr *CNE,
+                                    const LocationContext *CallerLC, SVal V) {
+  assert(!State->get<CXXNewAllocatorValues>(std::make_pair(CNE, CallerLC)) &&
+         "Allocator value already set!");
+  return State->set<CXXNewAllocatorValues>(std::make_pair(CNE, CallerLC), V);
+}
+
+SVal ExprEngine::getCXXNewAllocatorValue(ProgramStateRef State,
+                                         const CXXNewExpr *CNE,
+                                         const LocationContext *CallerLC) {
+  return *State->get<CXXNewAllocatorValues>(std::make_pair(CNE, CallerLC));
+}
+
+ProgramStateRef
+ExprEngine::clearCXXNewAllocatorValue(ProgramStateRef State,
+                                      const CXXNewExpr *CNE,
+                                      const LocationContext *CallerLC) {
+  return State->remove<CXXNewAllocatorValues>(std::make_pair(CNE, CallerLC));
+}
+
+bool ExprEngine::areCXXNewAllocatorValuesClear(ProgramStateRef State,
+                                               const LocationContext *FromLC,
+                                               const LocationContext *ToLC) {
+  const LocationContext *LC = FromLC;
+  do {
+    for (auto I : State->get<CXXNewAllocatorValues>())
+      if (I.first.second == LC)
+        return false;
+
+    LC = LC->getParent();
+    assert(LC && "ToLC must be a parent of FromLC!");
+  } while (LC != ToLC);
+  return true;
+}
+
 //===----------------------------------------------------------------------===//
 // Top-level transfer function logic (Dispatcher).
 //===----------------------------------------------------------------------===//
@@ -428,6 +480,13 @@ void ExprEngine::removeDead(ExplodedNode *Pred, ExplodedNodeSet &Out,
 
   const StackFrameContext *SFC = LC ? LC->getCurrentStackFrame() : nullptr;
   SymbolReaper SymReaper(SFC, ReferenceStmt, SymMgr, getStoreManager());
+
+  for (auto I : CleanedState->get<CXXNewAllocatorValues>()) {
+    if (SymbolRef Sym = I.second.getAsSymbol())
+      SymReaper.markLive(Sym);
+    if (const MemRegion *MR = I.second.getAsRegion())
+      SymReaper.markElementIndicesLive(MR);
+  }
 
   getCheckerManager().runCheckersForLiveSymbols(CleanedState, SymReaper);
 
@@ -1150,7 +1209,7 @@ void ExprEngine::Visit(const Stmt *S, ExplodedNode *Pred,
 
     case Stmt::ArraySubscriptExprClass:
       Bldr.takeNodes(Pred);
-      VisitLvalArraySubscriptExpr(cast<ArraySubscriptExpr>(S), Pred, Dst);
+      VisitArraySubscriptExpr(cast<ArraySubscriptExpr>(S), Pred, Dst);
       Bldr.addNodes(Dst);
       break;
 
@@ -1265,8 +1324,16 @@ void ExprEngine::Visit(const Stmt *S, ExplodedNode *Pred,
 
     case Stmt::CXXNewExprClass: {
       Bldr.takeNodes(Pred);
+
+      ExplodedNodeSet PreVisit;
+      getCheckerManager().runCheckersForPreStmt(PreVisit, Pred, S, *this);
+
       ExplodedNodeSet PostVisit;
-      VisitCXXNewExpr(cast<CXXNewExpr>(S), Pred, PostVisit);
+      for (ExplodedNodeSet::iterator i = PreVisit.begin(),
+                                     e = PreVisit.end(); i != e ; ++i) {
+        VisitCXXNewExpr(cast<CXXNewExpr>(S), *i, PostVisit);
+      }
+
       getCheckerManager().runCheckersForPostStmt(Dst, PostVisit, S, *this);
       Bldr.addNodes(Dst);
       break;
@@ -2108,10 +2175,12 @@ void ExprEngine::VisitCommonDeclRefExpr(const Expr *Ex, const NamedDecl *D,
                       ProgramPoint::PostLValueKind);
     return;
   }
-  if (isa<FieldDecl>(D)) {
+  if (isa<FieldDecl>(D) || isa<IndirectFieldDecl>(D)) {
     // FIXME: Compute lvalue of field pointers-to-member.
     // Right now we just use a non-null void pointer, so that it gives proper
     // results in boolean contexts.
+    // FIXME: Maybe delegate this to the surrounding operator&.
+    // Note how this expression is lvalue, however pointer-to-member is NonLoc.
     SVal V = svalBuilder.conjureSymbolVal(Ex, LCtx, getContext().VoidPtrTy,
                                           currBldrCtx->blockCount());
     state = state->assume(V.castAs<DefinedOrUnknownSVal>(), true);
@@ -2124,10 +2193,9 @@ void ExprEngine::VisitCommonDeclRefExpr(const Expr *Ex, const NamedDecl *D,
 }
 
 /// VisitArraySubscriptExpr - Transfer function for array accesses
-void ExprEngine::VisitLvalArraySubscriptExpr(const ArraySubscriptExpr *A,
+void ExprEngine::VisitArraySubscriptExpr(const ArraySubscriptExpr *A,
                                              ExplodedNode *Pred,
                                              ExplodedNodeSet &Dst){
-
   const Expr *Base = A->getBase()->IgnoreParens();
   const Expr *Idx  = A->getIdx()->IgnoreParens();
 
@@ -2136,18 +2204,40 @@ void ExprEngine::VisitLvalArraySubscriptExpr(const ArraySubscriptExpr *A,
 
   ExplodedNodeSet EvalSet;
   StmtNodeBuilder Bldr(CheckerPreStmt, EvalSet, *currBldrCtx);
-  assert(A->isGLValue() ||
-          (!AMgr.getLangOpts().CPlusPlus &&
-           A->getType().isCForbiddenLValueType()));
+
+  bool IsVectorType = A->getBase()->getType()->isVectorType();
+
+  // The "like" case is for situations where C standard prohibits the type to
+  // be an lvalue, e.g. taking the address of a subscript of an expression of
+  // type "void *".
+  bool IsGLValueLike = A->isGLValue() ||
+    (A->getType().isCForbiddenLValueType() && !AMgr.getLangOpts().CPlusPlus);
 
   for (auto *Node : CheckerPreStmt) {
     const LocationContext *LCtx = Node->getLocationContext();
     ProgramStateRef state = Node->getState();
-    SVal V = state->getLValue(A->getType(),
-                              state->getSVal(Idx, LCtx),
-                              state->getSVal(Base, LCtx));
-    Bldr.generateNode(A, Node, state->BindExpr(A, LCtx, V), nullptr,
-                      ProgramPoint::PostLValueKind);
+
+    if (IsGLValueLike) {
+      QualType T = A->getType();
+
+      // One of the forbidden LValue types! We still need to have sensible
+      // symbolic locations to represent this stuff. Note that arithmetic on
+      // void pointers is a GCC extension.
+      if (T->isVoidType())
+        T = getContext().CharTy;
+
+      SVal V = state->getLValue(T,
+                                state->getSVal(Idx, LCtx),
+                                state->getSVal(Base, LCtx));
+      Bldr.generateNode(A, Node, state->BindExpr(A, LCtx, V), nullptr,
+          ProgramPoint::PostLValueKind);
+    } else if (IsVectorType) {
+      // FIXME: non-glvalue vector reads are not modelled.
+      Bldr.generateNode(A, Node, state, nullptr);
+    } else {
+      llvm_unreachable("Array subscript should be an lValue when not \
+a vector and not a forbidden lvalue type");
+    }
   }
 
   getCheckerManager().runCheckersForPostStmt(Dst, EvalSet, A, *this);
@@ -2848,6 +2938,8 @@ struct DOTGraphTraits<ExplodedNode*> :
           Out << "\\lPostStore\\l";
         else if (Loc.getAs<PostLValue>())
           Out << "\\lPostLValue\\l";
+        else if (Loc.getAs<PostAllocatorCall>())
+          Out << "\\lPostAllocatorCall\\l";
 
         break;
       }

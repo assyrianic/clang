@@ -32,6 +32,8 @@ const Builtin::Info WebAssemblyTargetInfo::BuiltinInfo[] = {
 bool WebAssemblyTargetInfo::hasFeature(StringRef Feature) const {
   return llvm::StringSwitch<bool>(Feature)
       .Case("simd128", SIMDLevel >= SIMD128)
+      .Case("nontrapping-fptoint", HasNontrappingFPToInt)
+      .Case("sign-ext", HasSignExt)
       .Default(false);
 }
 
@@ -59,6 +61,22 @@ bool WebAssemblyTargetInfo::handleTargetFeatures(
     }
     if (Feature == "-simd128") {
       SIMDLevel = std::min(SIMDLevel, SIMDEnum(SIMD128 - 1));
+      continue;
+    }
+    if (Feature == "+nontrapping-fptoint") {
+      HasNontrappingFPToInt = true;
+      continue;
+    }
+    if (Feature == "-nontrapping-fptoint") {
+      HasNontrappingFPToInt = false;
+      continue;
+    }
+    if (Feature == "+sign-ext") {
+      HasSignExt = true;
+      continue;
+    }
+    if (Feature == "-sign-ext") {
+      HasSignExt = false;
       continue;
     }
 

@@ -18,6 +18,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+
 #define DEBUG_TYPE "format-parser"
 
 namespace clang {
@@ -331,7 +333,19 @@ void UnwrappedLineParser::parseLevel(bool HasOpeningBrace) {
       nextToken();
       addUnwrappedLine();
       break;
-    case tok::kw_default:
+    case tok::kw_default: {
+      unsigned StoredPosition = Tokens->getPosition();
+      FormatToken *Next = Tokens->getNextToken();
+      FormatTok = Tokens->setPosition(StoredPosition);
+      if (Next && Next->isNot(tok::colon)) {
+        // default not followed by ':' is not a case label; treat it like
+        // an identifier.
+        parseStructuralElement();
+        break;
+      }
+      // Else, if it is 'default:', fall through to the case handling.
+      LLVM_FALLTHROUGH;
+    }
     case tok::kw_case:
       if (Style.Language == FormatStyle::LK_JavaScript &&
           Line->MustBeDeclaration) {
@@ -377,13 +391,16 @@ void UnwrappedLineParser::calculateBraceTypes(bool ExpectClassBody) {
     switch (Tok->Tok.getKind()) {
     case tok::l_brace:
       if (Style.Language == FormatStyle::LK_JavaScript && PrevTok) {
-        if (PrevTok->is(tok::colon))
-          // A colon indicates this code is in a type, or a braced list
-          // following a label in an object literal ({a: {b: 1}}). The code
-          // below could be confused by semicolons between the individual
-          // members in a type member list, which would normally trigger
-          // BK_Block. In both cases, this must be parsed as an inline braced
-          // init.
+        if (PrevTok->isOneOf(tok::colon, tok::less))
+          // A ':' indicates this code is in a type, or a braced list
+          // following a label in an object literal ({a: {b: 1}}).
+          // A '<' could be an object used in a comparison, but that is nonsense
+          // code (can never return true), so more likely it is a generic type
+          // argument (`X<{a: string; b: number}>`).
+          // The code below could be confused by semicolons between the
+          // individual members in a type member list, which would normally
+          // trigger BK_Block. In both cases, this must be parsed as an inline
+          // braced init.
           Tok->BlockKind = BK_BracedInit;
         else if (PrevTok->is(tok::r_paren))
           // `) { }` can only occur in function or method declarations in JS.
@@ -891,11 +908,14 @@ void UnwrappedLineParser::readTokenWithJavaScriptASI() {
   bool PreviousMustBeValue = mustBeJSIdentOrValue(Keywords, Previous);
   bool PreviousStartsTemplateExpr =
       Previous->is(TT_TemplateString) && Previous->TokenText.endswith("${");
-  if (PreviousMustBeValue && Line && Line->Tokens.size() > 1) {
-    // If the token before the previous one is an '@', the previous token is an
-    // annotation and can precede another identifier/value.
-    const FormatToken *PrePrevious = std::prev(Line->Tokens.end(), 2)->Tok;
-    if (PrePrevious->is(tok::at))
+  if (PreviousMustBeValue || Previous->is(tok::r_paren)) {
+    // If the line contains an '@' sign, the previous token might be an
+    // annotation, which can precede another identifier/value.
+    bool HasAt = std::find_if(Line->Tokens.begin(), Line->Tokens.end(),
+                              [](UnwrappedLineNode &LineNode) {
+                                return LineNode.Tok->is(tok::at);
+                              }) != Line->Tokens.end();
+    if (HasAt)
       return;
   }
   if (Next->is(tok::exclaim) && PreviousMustBeValue)
@@ -924,49 +944,6 @@ void UnwrappedLineParser::parseStructuralElement() {
     return;
   }
   switch (FormatTok->Tok.getKind()) {
-  case tok::at:
-    nextToken();
-    if (FormatTok->Tok.is(tok::l_brace)) {
-      nextToken();
-      parseBracedList();
-      break;
-    }
-    switch (FormatTok->Tok.getObjCKeywordID()) {
-    case tok::objc_public:
-    case tok::objc_protected:
-    case tok::objc_package:
-    case tok::objc_private:
-      return parseAccessSpecifier();
-    case tok::objc_interface:
-    case tok::objc_implementation:
-      return parseObjCInterfaceOrImplementation();
-    case tok::objc_protocol:
-      return parseObjCProtocol();
-    case tok::objc_end:
-      return; // Handled by the caller.
-    case tok::objc_optional:
-    case tok::objc_required:
-      nextToken();
-      addUnwrappedLine();
-      return;
-    case tok::objc_autoreleasepool:
-      nextToken();
-      if (FormatTok->Tok.is(tok::l_brace)) {
-        if (Style.BraceWrapping.AfterObjCDeclaration)
-          addUnwrappedLine();
-        parseBlock(/*MustBeDeclaration=*/false);
-      }
-      addUnwrappedLine();
-      return;
-    case tok::objc_try:
-      // This branch isn't strictly necessary (the kw_try case below would
-      // do this too after the tok::at is parsed above).  But be explicit.
-      parseTryCatch();
-      return;
-    default:
-      break;
-    }
-    break;
   case tok::kw_asm:
     nextToken();
     if (FormatTok->is(tok::l_brace)) {
@@ -1024,8 +1001,12 @@ void UnwrappedLineParser::parseStructuralElement() {
       // 'default: string' field declaration.
       break;
     nextToken();
-    parseLabel();
-    return;
+    if (FormatTok->is(tok::colon)) {
+      parseLabel();
+      return;
+    }
+    // e.g. "default void f() {}" in a Java interface.
+    break;
   case tok::kw_case:
     if (Style.Language == FormatStyle::LK_JavaScript && Line->MustBeDeclaration)
       // 'case: string' field declaration.
@@ -1109,6 +1090,44 @@ void UnwrappedLineParser::parseStructuralElement() {
       if (FormatTok->Tok.is(tok::l_brace)) {
         nextToken();
         parseBracedList();
+        break;
+      }
+      switch (FormatTok->Tok.getObjCKeywordID()) {
+      case tok::objc_public:
+      case tok::objc_protected:
+      case tok::objc_package:
+      case tok::objc_private:
+        return parseAccessSpecifier();
+      case tok::objc_interface:
+      case tok::objc_implementation:
+        return parseObjCInterfaceOrImplementation();
+      case tok::objc_protocol:
+        if (parseObjCProtocol())
+          return;
+        break;
+      case tok::objc_end:
+        return; // Handled by the caller.
+      case tok::objc_optional:
+      case tok::objc_required:
+        nextToken();
+        addUnwrappedLine();
+        return;
+      case tok::objc_autoreleasepool:
+        nextToken();
+        if (FormatTok->Tok.is(tok::l_brace)) {
+          if (Style.BraceWrapping.AfterObjCDeclaration)
+            addUnwrappedLine();
+          parseBlock(/*MustBeDeclaration=*/false);
+        }
+        addUnwrappedLine();
+        return;
+      case tok::objc_try:
+        // This branch isn't strictly necessary (the kw_try case below would
+        // do this too after the tok::at is parsed above).  But be explicit.
+        parseTryCatch();
+        return;
+      default:
+        break;
       }
       break;
     case tok::kw_enum:
@@ -2105,6 +2124,8 @@ void UnwrappedLineParser::parseObjCUntilAtEnd() {
 }
 
 void UnwrappedLineParser::parseObjCInterfaceOrImplementation() {
+  assert(FormatTok->Tok.getObjCKeywordID() == tok::objc_interface ||
+         FormatTok->Tok.getObjCKeywordID() == tok::objc_implementation);
   nextToken();
   nextToken(); // interface name
 
@@ -2132,8 +2153,21 @@ void UnwrappedLineParser::parseObjCInterfaceOrImplementation() {
   parseObjCUntilAtEnd();
 }
 
-void UnwrappedLineParser::parseObjCProtocol() {
+// Returns true for the declaration/definition form of @protocol,
+// false for the expression form.
+bool UnwrappedLineParser::parseObjCProtocol() {
+  assert(FormatTok->Tok.getObjCKeywordID() == tok::objc_protocol);
   nextToken();
+
+  if (FormatTok->is(tok::l_paren))
+    // The expression form of @protocol, e.g. "Protocol* p = @protocol(foo);".
+    return false;
+
+  // The definition/declaration form,
+  // @protocol Foo
+  // - (int)someMethod;
+  // @end
+
   nextToken(); // protocol name
 
   if (FormatTok->Tok.is(tok::less))
@@ -2142,11 +2176,13 @@ void UnwrappedLineParser::parseObjCProtocol() {
   // Check for protocol declaration.
   if (FormatTok->Tok.is(tok::semi)) {
     nextToken();
-    return addUnwrappedLine();
+    addUnwrappedLine();
+    return true;
   }
 
   addUnwrappedLine();
   parseObjCUntilAtEnd();
+  return true;
 }
 
 void UnwrappedLineParser::parseJavaScriptEs6ImportExport() {

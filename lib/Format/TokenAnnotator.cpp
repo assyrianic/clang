@@ -462,13 +462,15 @@ private:
           FormatToken *Previous = CurrentToken->getPreviousNonComment();
           if (Previous->is(TT_JsTypeOptionalQuestion))
             Previous = Previous->getPreviousNonComment();
-          if (((CurrentToken->is(tok::colon) &&
-                (!Contexts.back().ColonIsDictLiteral || !Style.isCpp())) ||
-               Style.Language == FormatStyle::LK_Proto ||
-               Style.Language == FormatStyle::LK_TextProto) &&
-              (Previous->Tok.getIdentifierInfo() ||
-               Previous->is(tok::string_literal)))
-            Previous->Type = TT_SelectorName;
+          if ((CurrentToken->is(tok::colon) &&
+               (!Contexts.back().ColonIsDictLiteral || !Style.isCpp())) ||
+              Style.Language == FormatStyle::LK_Proto ||
+              Style.Language == FormatStyle::LK_TextProto) {
+            Left->Type = TT_DictLiteral;
+            if (Previous->Tok.getIdentifierInfo() ||
+                Previous->is(tok::string_literal))
+              Previous->Type = TT_SelectorName;
+          }
           if (CurrentToken->is(tok::colon) ||
               Style.Language == FormatStyle::LK_JavaScript)
             Left->Type = TT_DictLiteral;
@@ -617,7 +619,9 @@ private:
       break;
     case tok::kw_for:
       if (Style.Language == FormatStyle::LK_JavaScript) {
-        if (Tok->Previous && Tok->Previous->is(tok::period))
+        // x.for and {for: ...}
+        if ((Tok->Previous && Tok->Previous->is(tok::period)) ||
+            (Tok->Next && Tok->Next->is(tok::colon)))
           break;
         // JS' for await ( ...
         if (CurrentToken && CurrentToken->is(Keywords.kw_await))
@@ -1514,7 +1518,7 @@ public:
                    AnnotatedLine &Line)
       : Style(Style), Keywords(Keywords), Current(Line.First) {}
 
-  /// \brief Parse expressions with the given operatore precedence.
+  /// \brief Parse expressions with the given operator precedence.
   void parse(int Precedence = 0) {
     // Skip 'return' and ObjC selector colons as they are not part of a binary
     // expression.
@@ -2151,7 +2155,7 @@ unsigned TokenAnnotator::splitPenalty(const AnnotatedLine &Line,
   if (Left.isOneOf(tok::plus, tok::comma) && Left.Previous &&
       Left.Previous->isLabelString() &&
       (Left.NextOperator || Left.OperatorIndex != 0))
-    return 45;
+    return 50;
   if (Right.is(tok::plus) && Left.isLabelString() &&
       (Right.NextOperator || Right.OperatorIndex != 0))
     return 25;
@@ -2433,8 +2437,9 @@ bool TokenAnnotator::spaceRequiredBefore(const AnnotatedLine &Line,
       return false;
     if (Right.is(TT_JsNonNullAssertion))
       return false;
-    if (Left.is(TT_JsNonNullAssertion) && Right.is(Keywords.kw_as))
-      return true; // "x! as string"
+    if (Left.is(TT_JsNonNullAssertion) &&
+        Right.isOneOf(Keywords.kw_as, Keywords.kw_in))
+      return true; // "x! as string", "x! in y"
   } else if (Style.Language == FormatStyle::LK_Java) {
     if (Left.is(tok::r_square) && Right.is(tok::l_brace))
       return true;
@@ -2698,12 +2703,17 @@ bool TokenAnnotator::canBreakBefore(const AnnotatedLine &Line,
   } else if (Style.Language == FormatStyle::LK_JavaScript) {
     const FormatToken *NonComment = Right.getPreviousNonComment();
     if (NonComment &&
-        NonComment->isOneOf(tok::kw_return, tok::kw_continue, tok::kw_break,
-                            tok::kw_throw, Keywords.kw_interface,
-                            Keywords.kw_type, tok::kw_static, tok::kw_public,
-                            tok::kw_private, tok::kw_protected,
-                            Keywords.kw_readonly, Keywords.kw_abstract,
-                            Keywords.kw_get, Keywords.kw_set))
+        NonComment->isOneOf(
+            tok::kw_return, Keywords.kw_yield, tok::kw_continue, tok::kw_break,
+            tok::kw_throw, Keywords.kw_interface, Keywords.kw_type,
+            tok::kw_static, tok::kw_public, tok::kw_private, tok::kw_protected,
+            Keywords.kw_readonly, Keywords.kw_abstract, Keywords.kw_get,
+            Keywords.kw_set, Keywords.kw_async, Keywords.kw_await))
+      return false; // Otherwise automatic semicolon insertion would trigger.
+    if (Right.NestingLevel == 0 &&
+        (Left.Tok.getIdentifierInfo() ||
+         Left.isOneOf(tok::r_square, tok::r_paren)) &&
+        Right.isOneOf(tok::l_square, tok::l_paren))
       return false; // Otherwise automatic semicolon insertion would trigger.
     if (Left.is(TT_JsFatArrow) && Right.is(tok::l_brace))
       return false;

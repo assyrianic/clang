@@ -139,6 +139,35 @@ and following ``__`` (double underscore) to avoid interference from a macro with
 the same name.  For instance, ``gnu::__const__`` can be used instead of
 ``gnu::const``.
 
+``__has_c_attribute``
+---------------------
+
+This function-like macro takes a single argument that is the name of an
+attribute exposed with the double square-bracket syntax in C mode. The argument
+can either be a single identifier or a scoped identifier. If the attribute is
+supported, a nonzero value is returned. If the attribute is not supported by the
+current compilation target, this macro evaluates to 0. It can be used like this:
+
+.. code-block:: c
+
+  #ifndef __has_c_attribute         // Optional of course.
+    #define __has_c_attribute(x) 0  // Compatibility with non-clang compilers.
+  #endif
+
+  ...
+  #if __has_c_attribute(fallthrough)
+    #define FALLTHROUGH [[fallthrough]]
+  #else
+    #define FALLTHROUGH
+  #endif
+  ...
+
+The attribute identifier (but not scope) can also be specified with a preceding
+and following ``__`` (double underscore) to avoid interference from a macro with
+the same name.  For instance, ``gnu::__const__`` can be used instead of
+``gnu::const``.
+
+
 ``__has_attribute``
 -------------------
 
@@ -1067,6 +1096,11 @@ The following type trait primitives are supported by Clang:
 * ``__is_constructible`` (MSVC 2013, clang)
 * ``__is_nothrow_constructible`` (MSVC 2013, clang)
 * ``__is_assignable`` (MSVC 2015, clang)
+* ``__reference_binds_to_temporary(T, U)`` (Clang):  Determines whether a
+  reference of type ``T`` bound to an expression of type ``U`` would bind to a
+  materialized temporary object. If ``T`` is not a reference type the result
+  is false. Note this trait will also return false when the initialization of
+  ``T`` from ``U`` is ill-formed.
 
 Blocks
 ======

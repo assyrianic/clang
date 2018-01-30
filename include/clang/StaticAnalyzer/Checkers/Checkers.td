@@ -86,7 +86,7 @@ def LLVM : Package<"llvm">;
 
 // The APIModeling package is for checkers that model APIs and don't perform
 // any diagnostics. These checkers are always turned on; this package is
-// intended for API modeling that is not controlled by the the target triple.
+// intended for API modeling that is not controlled by the target triple.
 def APIModeling : Package<"apiModeling">, Hidden;
 def GoogleAPIModeling : Package<"google">, InPackage<APIModeling>;
 
@@ -187,6 +187,10 @@ def TestAfterDivZeroChecker : Checker<"TestAfterDivZero">,
 def DynamicTypeChecker : Checker<"DynamicTypeChecker">,
   HelpText<"Check for cases where the dynamic and the static type of an object are unrelated.">,
   DescFile<"DynamicTypeChecker.cpp">;
+
+def StackAddrAsyncEscapeChecker : Checker<"StackAddressAsyncEscape">,
+  HelpText<"Check that addresses to stack memory do not escape the function">,
+  DescFile<"StackAddrEscapeChecker.cpp">;
 
 } // end "alpha.core"
 

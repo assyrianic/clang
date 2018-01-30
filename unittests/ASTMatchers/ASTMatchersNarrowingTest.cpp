@@ -1770,6 +1770,84 @@ TEST(IsExplicitTemplateSpecialization,
     functionDecl(isExplicitTemplateSpecialization())));
 }
 
+TEST(TypeMatching, MatchesNoReturn) {
+  EXPECT_TRUE(notMatches("void func();", functionDecl(isNoReturn())));
+  EXPECT_TRUE(notMatches("void func() {}", functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(notMatchesC("void func();", functionDecl(isNoReturn())));
+  EXPECT_TRUE(notMatchesC("void func() {}", functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(
+      notMatches("struct S { void func(); };", functionDecl(isNoReturn())));
+  EXPECT_TRUE(
+      notMatches("struct S { void func() {} };", functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(notMatches("struct S { static void func(); };",
+                         functionDecl(isNoReturn())));
+  EXPECT_TRUE(notMatches("struct S { static void func() {} };",
+                         functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(notMatches("struct S { S(); };", functionDecl(isNoReturn())));
+  EXPECT_TRUE(notMatches("struct S { S() {} };", functionDecl(isNoReturn())));
+
+  // ---
+
+  EXPECT_TRUE(matches("[[noreturn]] void func();", functionDecl(isNoReturn())));
+  EXPECT_TRUE(
+      matches("[[noreturn]] void func() {}", functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(matches("struct S { [[noreturn]] void func(); };",
+                      functionDecl(isNoReturn())));
+  EXPECT_TRUE(matches("struct S { [[noreturn]] void func() {} };",
+                      functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(matches("struct S { [[noreturn]] static void func(); };",
+                      functionDecl(isNoReturn())));
+  EXPECT_TRUE(matches("struct S { [[noreturn]] static void func() {} };",
+                      functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(
+      matches("struct S { [[noreturn]] S(); };", functionDecl(isNoReturn())));
+  EXPECT_TRUE(matches("struct S { [[noreturn]] S() {} };",
+                      functionDecl(isNoReturn())));
+
+  // ---
+
+  EXPECT_TRUE(matches("__attribute__((noreturn)) void func();",
+                      functionDecl(isNoReturn())));
+  EXPECT_TRUE(matches("__attribute__((noreturn)) void func() {}",
+                      functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(matches("struct S { __attribute__((noreturn)) void func(); };",
+                      functionDecl(isNoReturn())));
+  EXPECT_TRUE(matches("struct S { __attribute__((noreturn)) void func() {} };",
+                      functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(
+      matches("struct S { __attribute__((noreturn)) static void func(); };",
+              functionDecl(isNoReturn())));
+  EXPECT_TRUE(
+      matches("struct S { __attribute__((noreturn)) static void func() {} };",
+              functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(matches("struct S { __attribute__((noreturn)) S(); };",
+                      functionDecl(isNoReturn())));
+  EXPECT_TRUE(matches("struct S { __attribute__((noreturn)) S() {} };",
+                      functionDecl(isNoReturn())));
+
+  // ---
+
+  EXPECT_TRUE(matchesC("__attribute__((noreturn)) void func();",
+                      functionDecl(isNoReturn())));
+  EXPECT_TRUE(matchesC("__attribute__((noreturn)) void func() {}",
+                      functionDecl(isNoReturn())));
+
+  EXPECT_TRUE(matchesC("_Noreturn void func();",
+                      functionDecl(isNoReturn())));
+  EXPECT_TRUE(matchesC("_Noreturn void func() {}",
+                      functionDecl(isNoReturn())));
+}
+
 TEST(TypeMatching, MatchesBool) {
   EXPECT_TRUE(matches("struct S { bool func(); };",
                       cxxMethodDecl(returns(booleanType()))));
@@ -2006,6 +2084,51 @@ TEST(IsArray, Basic) {
 TEST(HasArraySize, Basic) {
   EXPECT_TRUE(matches("struct MyClass {}; MyClass *p1 = new MyClass[10];",
                       cxxNewExpr(hasArraySize(integerLiteral(equals(10))))));
+}
+
+TEST(HasDefinition, MatchesStructDefinition) {
+  EXPECT_TRUE(matches("struct x {};",
+                      cxxRecordDecl(hasDefinition())));
+  EXPECT_TRUE(notMatches("struct x;",
+                      cxxRecordDecl(hasDefinition())));
+}
+
+TEST(HasDefinition, MatchesClassDefinition) {
+  EXPECT_TRUE(matches("class x {};",
+                      cxxRecordDecl(hasDefinition())));
+  EXPECT_TRUE(notMatches("class x;",
+                      cxxRecordDecl(hasDefinition())));
+}
+
+TEST(HasDefinition, MatchesUnionDefinition) {
+  EXPECT_TRUE(matches("union x {};",
+                      cxxRecordDecl(hasDefinition())));
+  EXPECT_TRUE(notMatches("union x;",
+                      cxxRecordDecl(hasDefinition())));
+}
+
+TEST(IsScopedEnum, MatchesScopedEnum) {
+  EXPECT_TRUE(matches("enum class X {};", enumDecl(isScoped())));
+  EXPECT_TRUE(notMatches("enum X {};", enumDecl(isScoped())));
+}
+
+TEST(HasTrailingReturn, MatchesTrailingReturn) {
+  EXPECT_TRUE(matches("auto Y() -> int { return 0; }",
+                      functionDecl(hasTrailingReturn())));
+  EXPECT_TRUE(matches("auto X() -> int;", functionDecl(hasTrailingReturn())));
+  EXPECT_TRUE(notMatches("int X() { return 0; }", 
+                      functionDecl(hasTrailingReturn())));
+  EXPECT_TRUE(notMatches("int X();", functionDecl(hasTrailingReturn())));
+  EXPECT_TRUE(notMatchesC("void X();", functionDecl(hasTrailingReturn())));
+}
+
+TEST(HasTrailingReturn, MatchesLambdaTrailingReturn) {
+  EXPECT_TRUE(matches(
+          "auto lambda2 = [](double x, double y) -> double {return x + y;};",
+          functionDecl(hasTrailingReturn())));
+  EXPECT_TRUE(notMatches(
+          "auto lambda2 = [](double x, double y) {return x + y;};",
+          functionDecl(hasTrailingReturn())));
 }
 
 } // namespace ast_matchers

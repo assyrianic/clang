@@ -1234,8 +1234,8 @@ static llvm::Value *CreateCoercedLoad(Address Src, llvm::Type *Ty,
 
   // Otherwise do coercion through memory. This is stupid, but simple.
   Address Tmp = CreateTempAllocaForCoercion(CGF, Ty, Src.getAlignment());
-  Address Casted = CGF.Builder.CreateBitCast(Tmp, CGF.Int8PtrTy);
-  Address SrcCasted = CGF.Builder.CreateBitCast(Src, CGF.Int8PtrTy);
+  Address Casted = CGF.Builder.CreateBitCast(Tmp, CGF.AllocaInt8PtrTy);
+  Address SrcCasted = CGF.Builder.CreateBitCast(Src, CGF.AllocaInt8PtrTy);
   CGF.Builder.CreateMemCpy(Casted, SrcCasted,
       llvm::ConstantInt::get(CGF.IntPtrTy, SrcSize),
       false);
@@ -1316,8 +1316,8 @@ static void CreateCoercedStore(llvm::Value *Src,
     // to that information.
     Address Tmp = CreateTempAllocaForCoercion(CGF, SrcTy, Dst.getAlignment());
     CGF.Builder.CreateStore(Src, Tmp);
-    Address Casted = CGF.Builder.CreateBitCast(Tmp, CGF.Int8PtrTy);
-    Address DstCasted = CGF.Builder.CreateBitCast(Dst, CGF.Int8PtrTy);
+    Address Casted = CGF.Builder.CreateBitCast(Tmp, CGF.AllocaInt8PtrTy);
+    Address DstCasted = CGF.Builder.CreateBitCast(Dst, CGF.AllocaInt8PtrTy);
     CGF.Builder.CreateMemCpy(DstCasted, Casted,
         llvm::ConstantInt::get(CGF.IntPtrTy, DstSize),
         false);
@@ -1744,6 +1744,11 @@ void CodeGenModule::ConstructDefaultFnAttrList(StringRef Name, bool HasOptnone,
       FuncAttrs.addAttribute("reciprocal-estimates",
                              llvm::join(Recips, ","));
 
+    if (!CodeGenOpts.PreferVectorWidth.empty() &&
+        CodeGenOpts.PreferVectorWidth != "none")
+      FuncAttrs.addAttribute("prefer-vector-width",
+                             CodeGenOpts.PreferVectorWidth);
+
     if (CodeGenOpts.StackRealignment)
       FuncAttrs.addAttribute("stackrealign");
     if (CodeGenOpts.Backchain)
@@ -1877,13 +1882,13 @@ void CodeGenModule::ConstructAttributeList(
     // we have a decl for the function and it has a target attribute then
     // parse that and add it to the feature set.
     StringRef TargetCPU = getTarget().getTargetOpts().CPU;
+    std::vector<std::string> Features;
     const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(TargetDecl);
     if (FD && FD->hasAttr<TargetAttr>()) {
       llvm::StringMap<bool> FeatureMap;
       getFunctionFeatureMap(FeatureMap, FD);
 
       // Produce the canonical string for this set of features.
-      std::vector<std::string> Features;
       for (llvm::StringMap<bool>::const_iterator it = FeatureMap.begin(),
                                                  ie = FeatureMap.end();
            it != ie; ++it)
@@ -1898,26 +1903,19 @@ void CodeGenModule::ConstructAttributeList(
       if (ParsedAttr.Architecture != "" &&
           getTarget().isValidCPUName(ParsedAttr.Architecture))
         TargetCPU = ParsedAttr.Architecture;
-      if (TargetCPU != "")
-         FuncAttrs.addAttribute("target-cpu", TargetCPU);
-      if (!Features.empty()) {
-        std::sort(Features.begin(), Features.end());
-        FuncAttrs.addAttribute(
-            "target-features",
-            llvm::join(Features, ","));
-      }
     } else {
       // Otherwise just add the existing target cpu and target features to the
       // function.
-      std::vector<std::string> &Features = getTarget().getTargetOpts().Features;
-      if (TargetCPU != "")
-        FuncAttrs.addAttribute("target-cpu", TargetCPU);
-      if (!Features.empty()) {
-        std::sort(Features.begin(), Features.end());
-        FuncAttrs.addAttribute(
-            "target-features",
-            llvm::join(Features, ","));
-      }
+      Features = getTarget().getTargetOpts().Features;
+    }
+
+    if (TargetCPU != "")
+      FuncAttrs.addAttribute("target-cpu", TargetCPU);
+    if (!Features.empty()) {
+      std::sort(Features.begin(), Features.end());
+      FuncAttrs.addAttribute(
+          "target-features",
+          llvm::join(Features, ","));
     }
   }
 
@@ -1927,11 +1925,11 @@ void CodeGenModule::ConstructAttributeList(
   const ABIArgInfo &RetAI = FI.getReturnInfo();
   switch (RetAI.getKind()) {
   case ABIArgInfo::Extend:
-    if (RetTy->hasSignedIntegerRepresentation())
+    if (RetAI.isSignExt())
       RetAttrs.addAttribute(llvm::Attribute::SExt);
-    else if (RetTy->hasUnsignedIntegerRepresentation())
+    else
       RetAttrs.addAttribute(llvm::Attribute::ZExt);
-    // FALL THROUGH
+    LLVM_FALLTHROUGH;
   case ABIArgInfo::Direct:
     if (RetAI.getInReg())
       RetAttrs.addAttribute(llvm::Attribute::InReg);
@@ -2008,15 +2006,11 @@ void CodeGenModule::ConstructAttributeList(
     // sense to do it here because parameters are so messed up.
     switch (AI.getKind()) {
     case ABIArgInfo::Extend:
-      if (ParamType->isSignedIntegerOrEnumerationType())
+      if (AI.isSignExt())
         Attrs.addAttribute(llvm::Attribute::SExt);
-      else if (ParamType->isUnsignedIntegerOrEnumerationType()) {
-        if (getTypes().getABIInfo().shouldSignExtUnsignedType(ParamType))
-          Attrs.addAttribute(llvm::Attribute::SExt);
-        else
-          Attrs.addAttribute(llvm::Attribute::ZExt);
-      }
-      // FALL THROUGH
+      else
+        Attrs.addAttribute(llvm::Attribute::ZExt);
+      LLVM_FALLTHROUGH;
     case ABIArgInfo::Direct:
       if (ArgNo == 0 && FI.isChainCall())
         Attrs.addAttribute(llvm::Attribute::Nest);
@@ -2257,11 +2251,16 @@ void CodeGenFunction::EmitFunctionProlog(const CGFunctionInfo &FI,
   for (FunctionArgList::const_iterator i = Args.begin(), e = Args.end();
        i != e; ++i, ++info_it, ++ArgNo) {
     const VarDecl *Arg = *i;
-    QualType Ty = info_it->type;
     const ABIArgInfo &ArgI = info_it->info;
 
     bool isPromoted =
       isa<ParmVarDecl>(Arg) && cast<ParmVarDecl>(Arg)->isKNRPromoted();
+    // We are converting from ABIArgInfo type to VarDecl type directly, unless
+    // the parameter is promoted. In this case we convert to
+    // CGFunctionInfo::ArgInfo type with subsequent argument demotion.
+    QualType Ty = isPromoted ? info_it->type : Arg->getType();
+    assert(hasScalarEvaluationKind(Ty) ==
+           hasScalarEvaluationKind(Arg->getType()));
 
     unsigned FirstIRArg, NumIRArgs;
     std::tie(FirstIRArg, NumIRArgs) = IRFunctionArgs.getIRArgs(ArgNo);
@@ -2760,6 +2759,12 @@ static llvm::StoreInst *findDominatingStoreToReturnValue(CodeGenFunction &CGF) {
 void CodeGenFunction::EmitFunctionEpilog(const CGFunctionInfo &FI,
                                          bool EmitRetDbgLoc,
                                          SourceLocation EndLoc) {
+  if (FI.isNoReturn()) {
+    // Noreturn functions don't return.
+    EmitUnreachable(EndLoc);
+    return;
+  }
+
   if (CurCodeDecl && CurCodeDecl->hasAttr<NakedAttr>()) {
     // Naked functions don't have epilogues.
     Builder.CreateUnreachable();
@@ -3539,9 +3544,9 @@ void CodeGenFunction::EmitCallArg(CallArgList &args, const Expr *E,
     } else {
       // We can't represent a misaligned lvalue in the CallArgList, so copy
       // to an aligned temporary now.
-      Address tmp = CreateMemTemp(type);
-      EmitAggregateCopy(tmp, L.getAddress(), type, L.isVolatile());
-      args.add(RValue::getAggregate(tmp), type);
+      LValue Dest = MakeAddrLValue(CreateMemTemp(type), type);
+      EmitAggregateCopy(Dest, L, type, L.isVolatile());
+      args.add(RValue::getAggregate(Dest.getAddress()), type);
     }
     return;
   }
@@ -3720,7 +3725,8 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
                                  const CGCallee &Callee,
                                  ReturnValueSlot ReturnValue,
                                  const CallArgList &CallArgs,
-                                 llvm::Instruction **callOrInvoke) {
+                                 llvm::Instruction **callOrInvoke,
+                                 SourceLocation Loc) {
   // FIXME: We no longer need the types from CallArgs; lift up and simplify.
 
   assert(Callee.isOrdinary());
@@ -3878,7 +3884,9 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
           Address AI = CreateMemTemp(I->Ty, ArgInfo.getIndirectAlign(),
                                      "byval-temp", false);
           IRCallArgs[FirstIRArg] = AI.getPointer();
-          EmitAggregateCopy(AI, Addr, I->Ty, RV.isVolatileQualified());
+          LValue Dest = MakeAddrLValue(AI, I->Ty);
+          LValue Src = MakeAddrLValue(Addr, I->Ty);
+          EmitAggregateCopy(Dest, Src, I->Ty, RV.isVolatileQualified());
         } else {
           // Skip the extra memcpy call.
           IRCallArgs[FirstIRArg] = Addr.getPointer();
@@ -4243,7 +4251,15 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
       EmitLifetimeEnd(llvm::ConstantInt::get(Int64Ty, UnusedReturnSize),
                       SRetPtr.getPointer());
 
-    Builder.CreateUnreachable();
+    // Strip away the noreturn attribute to better diagnose unreachable UB.
+    if (SanOpts.has(SanitizerKind::Unreachable)) {
+      if (auto *F = CS.getCalledFunction())
+        F->removeFnAttr(llvm::Attribute::NoReturn);
+      CS.removeAttribute(llvm::AttributeList::FunctionIndex,
+                         llvm::Attribute::NoReturn);
+    }
+
+    EmitUnreachable(Loc);
     Builder.ClearInsertionPoint();
 
     // FIXME: For now, emit a dummy basic block because expr emitters in

@@ -304,9 +304,15 @@ private:
     if (TheLine->First->is(tok::l_brace) && TheLine->First == TheLine->Last &&
         I != AnnotatedLines.begin() &&
         I[-1]->First->isOneOf(tok::kw_if, tok::kw_while, tok::kw_for)) {
-      return Style.AllowShortBlocksOnASingleLine
-                 ? tryMergeSimpleBlock(I - 1, E, Limit)
-                 : 0;
+      unsigned MergedLines = 0;
+      if (Style.AllowShortBlocksOnASingleLine) {
+        MergedLines = tryMergeSimpleBlock(I - 1, E, Limit);
+        // If we managed to merge the block, discard the first merged line
+        // since we are merging starting from I.
+        if (MergedLines > 0)
+          --MergedLines;
+      }
+      return MergedLines;
     }
     // Try to merge a block with left brace wrapped that wasn't yet covered
     if (TheLine->Last->is(tok::l_brace)) {
@@ -517,8 +523,13 @@ private:
       } else if (Limit != 0 && !Line.startsWith(tok::kw_namespace) &&
                  !startsExternCBlock(Line)) {
         // We don't merge short records.
-        FormatToken *RecordTok =
-            Line.First->is(tok::kw_typedef) ? Line.First->Next : Line.First;
+        FormatToken *RecordTok = Line.First;
+        // Skip record modifiers.
+        while (RecordTok->Next &&
+               RecordTok->isOneOf(tok::kw_typedef, tok::kw_export,
+                                  Keywords.kw_declare, Keywords.kw_abstract,
+                                  tok::kw_default))
+          RecordTok = RecordTok->Next;
         if (RecordTok &&
             RecordTok->isOneOf(tok::kw_class, tok::kw_union, tok::kw_struct,
                                Keywords.kw_interface))

@@ -529,7 +529,7 @@ CastKind Sema::ScalarTypeToBooleanCastKind(QualType ScalarTy) {
   case Type::STK_IntegralComplex: return CK_IntegralComplexToBoolean;
   case Type::STK_FloatingComplex: return CK_FloatingComplexToBoolean;
   }
-  return CK_Invalid;
+  llvm_unreachable("unknown scalar type kind");
 }
 
 /// \brief Used to prune the decls of Sema's UnusedFileScopedDecls vector.
@@ -1647,6 +1647,12 @@ static void noteOverloads(Sema &S, const UnresolvedSetImpl &Overloads,
     }
 
     NamedDecl *Fn = (*It)->getUnderlyingDecl();
+    // Don't print overloads for non-default multiversioned functions.
+    if (const auto *FD = Fn->getAsFunction()) {
+      if (FD->isMultiVersion() &&
+          !FD->getAttr<TargetAttr>()->isDefaultVersion())
+        continue;
+    }
     S.Diag(Fn->getLocation(), diag::note_possible_target_of_call);
     ++ShownOverloads;
   }

@@ -57,11 +57,11 @@ static void DummyArgToStringFn(DiagnosticsEngine::ArgumentKind AK, intptr_t QT,
   Output.append(Str.begin(), Str.end());
 }
 
-DiagnosticsEngine::DiagnosticsEngine(IntrusiveRefCntPtr<DiagnosticIDs> diags,
-                                     DiagnosticOptions *DiagOpts,
-                                     DiagnosticConsumer *client,
-                                     bool ShouldOwnClient)
-    : Diags(std::move(diags)), DiagOpts(DiagOpts), Client(nullptr),
+DiagnosticsEngine::DiagnosticsEngine(
+    IntrusiveRefCntPtr<DiagnosticIDs> diags,
+    IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts, DiagnosticConsumer *client,
+    bool ShouldOwnClient)
+    : Diags(std::move(diags)), DiagOpts(std::move(DiagOpts)), Client(nullptr),
       SourceMgr(nullptr) {
   setClient(client, ShouldOwnClient);
   ArgToStringFn = DummyArgToStringFn;
@@ -363,7 +363,7 @@ void DiagnosticsEngine::setSeverityForAll(diag::Flavor Flavor,
                                           diag::Severity Map,
                                           SourceLocation Loc) {
   // Get all the diagnostics.
-  SmallVector<diag::kind, 64> AllDiags;
+  std::vector<diag::kind> AllDiags;
   DiagnosticIDs::getAllDiagnostics(Flavor, AllDiags);
 
   // Set the mapping.

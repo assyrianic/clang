@@ -116,9 +116,17 @@ Output path for the plist report
 .. option:: -bundle\_loader <arg>
 .. program:: clang
 
+.. option:: -cfguard
+
+Emit tables required for Windows Control Flow Guard.
+
 .. option:: -client\_name<arg>
 
 .. option:: -compatibility\_version<arg>
+
+.. option:: --config <arg>
+
+Specifies configuration file
 
 .. option:: --constant-cfstrings
 
@@ -1175,6 +1183,10 @@ Load the clang builtins module map file.
 
 .. option:: -fcaret-diagnostics, -fno-caret-diagnostics
 
+.. option:: -fcf-protection=<arg>, -fcf-protection (equivalent to -fcf-protection=full)
+
+Instrument control-flow architecture protection. Options: return, branch, full, none.
+
 .. option:: -fclasspath=<arg>, --CLASSPATH <arg>, --CLASSPATH=<arg>, --classpath <arg>, --classpath=<arg>
 
 .. option:: -fcolor-diagnostics, -fno-color-diagnostics
@@ -1281,6 +1293,10 @@ Enable '\[\[\]\]' attributes in all C and C++ language modes
 
 .. option:: -fdwarf-directory-asm, -fno-dwarf-directory-asm
 
+.. option:: -fdwarf-exceptions
+
+Use DWARF style exceptions
+
 .. option:: -felide-constructors, -fno-elide-constructors
 
 .. option:: -feliminate-unused-debug-symbols, -fno-eliminate-unused-debug-symbols
@@ -1356,6 +1372,10 @@ Implicitly search the file system for module map files.
 .. option:: -fimplicit-modules, -fno-implicit-modules
 
 .. option:: -finput-charset=<arg>
+
+.. option:: -finstrument-function-entry-bare
+
+Instrument function entry only, after inlining, without arguments to the instrumentation call
 
 .. option:: -finstrument-functions
 
@@ -1537,6 +1557,10 @@ Enable ARC-style weak references in Objective-C
 
 OpenMP target code is compiled as relocatable using the -c flag. For OpenMP targets the code is relocatable by default.
 
+.. option:: -fopenmp-simd, -fno-openmp-simd
+
+Emit OpenMP code only for SIMD-based constructs.
+
 .. option:: -fopenmp-use-tls
 
 .. option:: -fopenmp-version=<arg>
@@ -1678,6 +1702,10 @@ Turn on loop reroller
 
 Generate a YAML optimization record file
 
+.. option:: -fseh-exceptions
+
+Use SEH style exceptions
+
 .. option:: -fshort-enums, -fno-short-enums
 
 Allocate to an enum type only as many bytes as it needs for the declared range of possible values
@@ -1735,6 +1763,10 @@ Force the usage of stack protectors for all functions
 .. option:: -fstack-protector-strong
 
 Use a strong heuristic to apply stack protectors to functions
+
+.. option:: -fstack-size-section, -fno-stack-size-section
+
+Emit section containing metadata on function stack sizes
 
 .. option:: -fstandalone-debug, -fno-limit-debug-info, -fno-standalone-debug
 
@@ -1862,6 +1894,10 @@ Treat signed integer overflow as two's complement
 
 Store string literals as writable data
 
+.. option:: -fxray-always-emit-customevents, -fno-xray-always-emit-customevents
+
+Determine whether to always emit \_\_xray\_customevent(...) calls even if the function it appears in is not always instrumented.
+
 .. option:: -fxray-always-instrument=<arg>
 
 Filename defining the whitelist for imbuing the 'always instrument' XRay attribute.
@@ -1982,7 +2018,7 @@ Link stack frames through backchain on System Z
 
 .. option:: -mconsole<arg>
 
-.. option:: -mcpu=<arg>, -mv4 (equivalent to -mcpu=hexagonv4), -mv5 (equivalent to -mcpu=hexagonv5), -mv55 (equivalent to -mcpu=hexagonv55), -mv60 (equivalent to -mcpu=hexagonv60), -mv62 (equivalent to -mcpu=hexagonv62)
+.. option:: -mcpu=<arg>, -mv4 (equivalent to -mcpu=hexagonv4), -mv5 (equivalent to -mcpu=hexagonv5), -mv55 (equivalent to -mcpu=hexagonv55), -mv60 (equivalent to -mcpu=hexagonv60), -mv62 (equivalent to -mcpu=hexagonv62), -mv65 (equivalent to -mcpu=hexagonv65)
 
 .. option:: -mdefault-build-attributes<arg>, -mno-default-build-attributes<arg>
 
@@ -2103,6 +2139,10 @@ Omit frame pointer setup for leaf functions
 .. option:: -mpie-copy-relocations, -mno-pie-copy-relocations
 
 Use copy relocations support for PIE builds
+
+.. option:: -mprefer-vector-width=<arg>
+
+Specifies preferred vector width for auto-vectorization. Defaults to 'none' which allows target specific decisions.
 
 .. option:: -mqdsp6-compat
 
@@ -2290,6 +2330,10 @@ PowerPC
 
 WebAssembly
 -----------
+.. option:: -mnontrapping-fptoint, -mno-nontrapping-fptoint
+
+.. option:: -msign-ext, -mno-sign-ext
+
 .. option:: -msimd128, -mno-simd128
 
 X86
@@ -2305,6 +2349,8 @@ X86
 .. option:: -mavx, -mno-avx
 
 .. option:: -mavx2, -mno-avx2
+
+.. option:: -mavx512bitalg, -mno-avx512bitalg
 
 .. option:: -mavx512bw, -mno-avx512bw
 
@@ -2322,7 +2368,11 @@ X86
 
 .. option:: -mavx512vbmi, -mno-avx512vbmi
 
+.. option:: -mavx512vbmi2, -mno-avx512vbmi2
+
 .. option:: -mavx512vl, -mno-avx512vl
+
+.. option:: -mavx512vnni, -mno-avx512vnni
 
 .. option:: -mavx512vpopcntdq, -mno-avx512vpopcntdq
 
@@ -2348,6 +2398,10 @@ X86
 
 .. option:: -mfxsr, -mno-fxsr
 
+.. option:: -mgfni, -mno-gfni
+
+.. option:: -mibt, -mno-ibt
+
 .. option:: -mlwp, -mno-lwp
 
 .. option:: -mlzcnt, -mno-lzcnt
@@ -2370,15 +2424,23 @@ X86
 
 .. option:: -mprfchw, -mno-prfchw
 
+.. option:: -mrdpid, -mno-rdpid
+
 .. option:: -mrdrnd, -mno-rdrnd
 
 .. option:: -mrdseed, -mno-rdseed
+
+.. option:: -mretpoline, -mno-retpoline
+
+.. option:: -mretpoline-external-thunk, -mno-retpoline-external-thunk
 
 .. option:: -mrtm, -mno-rtm
 
 .. option:: -msgx, -mno-sgx
 
 .. option:: -msha, -mno-sha
+
+.. option:: -mshstk, -mno-shstk
 
 .. option:: -msse, -mno-sse
 
@@ -2397,6 +2459,10 @@ X86
 .. option:: -mssse3, -mno-ssse3
 
 .. option:: -mtbm, -mno-tbm
+
+.. option:: -mvaes, -mno-vaes
+
+.. option:: -mvpclmulqdq, -mno-vpclmulqdq
 
 .. option:: -mx87, -m80387, -mno-x87
 

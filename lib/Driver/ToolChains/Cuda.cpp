@@ -13,6 +13,7 @@
 #include "clang/Basic/Cuda.h"
 #include "clang/Config/config.h"
 #include "clang/Basic/VirtualFileSystem.h"
+#include "clang/Driver/Distro.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/Driver.h"
 #include "clang/Driver/DriverDiagnostic.h"
@@ -51,6 +52,8 @@ static CudaVersion ParseCudaVersionFile(llvm::StringRef V) {
     return CudaVersion::CUDA_80;
   if (Major == 9 && Minor == 0)
     return CudaVersion::CUDA_90;
+  if (Major == 9 && Minor == 1)
+    return CudaVersion::CUDA_91;
   return CudaVersion::UNKNOWN;
 }
 
@@ -75,6 +78,11 @@ CudaInstallationDetector::CudaInstallationDetector(
     CudaPathCandidates.push_back(D.SysRoot + "/usr/local/cuda");
     for (const char *Ver : Versions)
       CudaPathCandidates.push_back(D.SysRoot + "/usr/local/cuda-" + Ver);
+
+    if (Distro(D.getVFS()).IsDebian())
+      // Special case for Debian to have nvidia-cuda-toolkit work
+      // out of the box. More info on http://bugs.debian.org/882505
+      CudaPathCandidates.push_back(D.SysRoot + "/usr/lib/cuda");
   }
 
   for (const auto &CudaPath : CudaPathCandidates) {
@@ -113,14 +121,18 @@ CudaInstallationDetector::CudaInstallationDetector(
       Version = ParseCudaVersionFile((*VersionFile)->getBuffer());
     }
 
-    if (Version == CudaVersion::CUDA_90) {
-      // CUDA-9 uses single libdevice file for all GPU variants.
+    if (Version >= CudaVersion::CUDA_90) {
+      // CUDA-9+ uses single libdevice file for all GPU variants.
       std::string FilePath = LibDevicePath + "/libdevice.10.bc";
       if (FS.exists(FilePath)) {
-        for (const char *GpuArch :
+        for (const char *GpuArchName :
              {"sm_20", "sm_30", "sm_32", "sm_35", "sm_50", "sm_52", "sm_53",
-              "sm_60", "sm_61", "sm_62", "sm_70"})
-          LibDeviceMap[GpuArch] = FilePath;
+                   "sm_60", "sm_61", "sm_62", "sm_70", "sm_72"}) {
+          const CudaArch GpuArch = StringToCudaArch(GpuArchName);
+          if (Version >= MinVersionForCudaArch(GpuArch) &&
+              Version <= MaxVersionForCudaArch(GpuArch))
+            LibDeviceMap[GpuArchName] = FilePath;
+        }
       }
     } else {
       std::error_code EC;

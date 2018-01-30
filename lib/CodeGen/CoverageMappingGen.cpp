@@ -74,7 +74,10 @@ public:
 
   bool hasEndLoc() const { return LocEnd.hasValue(); }
 
-  void setEndLoc(SourceLocation Loc) { LocEnd = Loc; }
+  void setEndLoc(SourceLocation Loc) {
+    assert(Loc.isValid() && "Setting an invalid end location");
+    LocEnd = Loc;
+  }
 
   SourceLocation getEndLoc() const {
     assert(LocEnd && "Region has no end location");
@@ -111,6 +114,9 @@ struct SpellingRegion {
     LineEnd = SM.getSpellingLineNumber(LocEnd);
     ColumnEnd = SM.getSpellingColumnNumber(LocEnd);
   }
+
+  SpellingRegion(SourceManager &SM, SourceMappingRegion &R)
+      : SpellingRegion(SM, R.getStartLoc(), R.getEndLoc()) {}
 
   /// Check if the start and end locations appear in source order, i.e
   /// top->bottom, left->right.
@@ -583,6 +589,7 @@ struct CounterCoverageMappingBuilder
           MostRecentLocation = getIncludeOrExpansionLoc(EndLoc);
 
         assert(SM.isWrittenInSameFile(Region.getStartLoc(), EndLoc));
+        assert(SpellingRegion(SM, Region).isInSourceOrder());
         SourceRegions.push_back(Region);
 
         if (ParentOfDeferredRegion) {
@@ -718,9 +725,11 @@ struct CounterCoverageMappingBuilder
       SourceLocation Loc = MostRecentLocation;
       while (isNestedIn(Loc, ParentFile)) {
         SourceLocation FileStart = getStartOfFileOrMacro(Loc);
-        if (StartLocs.insert(FileStart).second)
+        if (StartLocs.insert(FileStart).second) {
           SourceRegions.emplace_back(*ParentCounter, FileStart,
                                      getEndOfFileOrMacro(Loc));
+          assert(SpellingRegion(SM, SourceRegions.back()).isInSourceOrder());
+        }
         Loc = getIncludeOrExpansionLoc(Loc);
       }
     }
@@ -753,12 +762,31 @@ struct CounterCoverageMappingBuilder
     LastTerminatedRegion = {EndLoc, RegionStack.size()};
   }
 
+  /// Find a valid gap range between \p AfterLoc and \p BeforeLoc.
+  Optional<SourceRange> findGapAreaBetween(SourceLocation AfterLoc,
+                                           SourceLocation BeforeLoc) {
+    // If the start and end locations of the gap are both within the same macro
+    // file, the range may not be in source order.
+    if (AfterLoc.isMacroID() || BeforeLoc.isMacroID())
+      return None;
+    if (!SM.isWrittenInSameFile(AfterLoc, BeforeLoc))
+      return None;
+    return {{AfterLoc, BeforeLoc}};
+  }
+
+  /// Find the source range after \p AfterStmt and before \p BeforeStmt.
+  Optional<SourceRange> findGapAreaBetween(const Stmt *AfterStmt,
+                                           const Stmt *BeforeStmt) {
+    return findGapAreaBetween(getPreciseTokenLocEnd(getEnd(AfterStmt)),
+                              getStart(BeforeStmt));
+  }
+
   /// Emit a gap region between \p StartLoc and \p EndLoc with the given count.
   void fillGapAreaWithCount(SourceLocation StartLoc, SourceLocation EndLoc,
                             Counter Count) {
-    if (StartLoc == EndLoc || StartLoc.isMacroID() || EndLoc.isMacroID() ||
-        !SM.isWrittenInSameFile(StartLoc, EndLoc))
+    if (StartLoc == EndLoc)
       return;
+    assert(SpellingRegion(SM, StartLoc, EndLoc).isInSourceOrder());
     handleFileExit(StartLoc);
     size_t Index = pushRegion(Count, StartLoc, EndLoc);
     getRegion().setGap(true);
@@ -914,6 +942,11 @@ struct CounterCoverageMappingBuilder
     propagateCounts(CondCount, S->getCond());
     adjustForOutOfOrderTraversal(getEnd(S));
 
+    // The body count applies to the area immediately after the increment.
+    auto Gap = findGapAreaBetween(S->getCond(), S->getBody());
+    if (Gap)
+      fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), BodyCount);
+
     Counter OutCount =
         addCounters(BC.BreakCount, subtractCounters(CondCount, BodyCount));
     if (OutCount != ParentCount)
@@ -968,6 +1001,12 @@ struct CounterCoverageMappingBuilder
       adjustForOutOfOrderTraversal(getEnd(S));
     }
 
+    // The body count applies to the area immediately after the increment.
+    auto Gap = findGapAreaBetween(getPreciseTokenLocEnd(S->getRParenLoc()),
+                                  getStart(S->getBody()));
+    if (Gap)
+      fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), BodyCount);
+
     Counter OutCount =
         addCounters(BC.BreakCount, subtractCounters(CondCount, BodyCount));
     if (OutCount != ParentCount)
@@ -986,6 +1025,12 @@ struct CounterCoverageMappingBuilder
     extendRegion(S->getBody());
     Counter BackedgeCount = propagateCounts(BodyCount, S->getBody());
     BreakContinue BC = BreakContinueStack.pop_back_val();
+
+    // The body count applies to the area immediately after the range.
+    auto Gap = findGapAreaBetween(getPreciseTokenLocEnd(S->getRParenLoc()),
+                                  getStart(S->getBody()));
+    if (Gap)
+      fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), BodyCount);
 
     Counter LoopCount =
         addCounters(ParentCount, BackedgeCount, BC.ContinueCount);
@@ -1006,6 +1051,12 @@ struct CounterCoverageMappingBuilder
     extendRegion(S->getBody());
     Counter BackedgeCount = propagateCounts(BodyCount, S->getBody());
     BreakContinue BC = BreakContinueStack.pop_back_val();
+
+    // The body count applies to the area immediately after the collection.
+    auto Gap = findGapAreaBetween(getPreciseTokenLocEnd(S->getRParenLoc()),
+                                  getStart(S->getBody()));
+    if (Gap)
+      fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), BodyCount);
 
     Counter LoopCount =
         addCounters(ParentCount, BackedgeCount, BC.ContinueCount);
@@ -1099,8 +1150,9 @@ struct CounterCoverageMappingBuilder
     propagateCounts(ParentCount, S->getCond());
 
     // The 'then' count applies to the area immediately after the condition.
-    fillGapAreaWithCount(getPreciseTokenLocEnd(getEnd(S->getCond())),
-                         getStart(S->getThen()), ThenCount);
+    auto Gap = findGapAreaBetween(S->getCond(), S->getThen());
+    if (Gap)
+      fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), ThenCount);
 
     extendRegion(S->getThen());
     Counter OutCount = propagateCounts(ThenCount, S->getThen());
@@ -1108,8 +1160,9 @@ struct CounterCoverageMappingBuilder
     Counter ElseCount = subtractCounters(ParentCount, ThenCount);
     if (const Stmt *Else = S->getElse()) {
       // The 'else' count applies to the area immediately after the 'then'.
-      fillGapAreaWithCount(getPreciseTokenLocEnd(getEnd(S->getThen())),
-                           getStart(Else), ElseCount);
+      Gap = findGapAreaBetween(S->getThen(), Else);
+      if (Gap)
+        fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), ElseCount);
       extendRegion(Else);
       OutCount = addCounters(OutCount, propagateCounts(ElseCount, Else));
     } else
@@ -1148,8 +1201,10 @@ struct CounterCoverageMappingBuilder
 
     if (!isa<BinaryConditionalOperator>(E)) {
       // The 'then' count applies to the area immediately after the condition.
-      fillGapAreaWithCount(E->getQuestionLoc(), getStart(E->getTrueExpr()),
-                           TrueCount);
+      auto Gap =
+          findGapAreaBetween(E->getQuestionLoc(), getStart(E->getTrueExpr()));
+      if (Gap)
+        fillGapAreaWithCount(Gap->getBegin(), Gap->getEnd(), TrueCount);
 
       extendRegion(E->getTrueExpr());
       propagateCounts(TrueCount, E->getTrueExpr());

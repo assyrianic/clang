@@ -1104,6 +1104,7 @@ void ASTWriter::WriteBlockInfoBlock() {
   RECORD(UNUSED_FILESCOPED_DECLS);
   RECORD(PPD_ENTITIES_OFFSETS);
   RECORD(VTABLE_USES);
+  RECORD(PPD_SKIPPED_RANGES);
   RECORD(REFERENCED_SELECTOR_POOL);
   RECORD(TU_UPDATE_LEXICAL);
   RECORD(SEMA_DECL_REFS);
@@ -2363,12 +2364,13 @@ void ASTWriter::WriteSourceManagerBlock(SourceManager &SourceMgr,
 
     // Emit the needed file names.
     llvm::DenseMap<int, int> FilenameMap;
+    FilenameMap[-1] = -1; // For unspecified filenames.
     for (const auto &L : LineTable) {
       if (L.first.ID < 0)
         continue;
       for (auto &LE : L.second) {
         if (FilenameMap.insert(std::make_pair(LE.FilenameID,
-                                              FilenameMap.size())).second)
+                                              FilenameMap.size() - 1)).second)
           AddPath(LineTable.getFilename(LE.FilenameID), Record);
       }
     }
@@ -2724,6 +2726,26 @@ void ASTWriter::WritePreprocessorDetail(PreprocessingRecord &PPRec) {
                                            NUM_PREDEF_PP_ENTITY_IDS};
     Stream.EmitRecordWithBlob(PPEOffsetAbbrev, Record,
                               bytes(PreprocessedEntityOffsets));
+  }
+
+  // Write the skipped region table for the preprocessing record.
+  ArrayRef<SourceRange> SkippedRanges = PPRec.getSkippedRanges();
+  if (SkippedRanges.size() > 0) {
+    std::vector<PPSkippedRange> SerializedSkippedRanges;
+    SerializedSkippedRanges.reserve(SkippedRanges.size());
+    for (auto const& Range : SkippedRanges)
+      SerializedSkippedRanges.emplace_back(Range);
+
+    using namespace llvm;
+    auto Abbrev = std::make_shared<BitCodeAbbrev>();
+    Abbrev->Add(BitCodeAbbrevOp(PPD_SKIPPED_RANGES));
+    Abbrev->Add(BitCodeAbbrevOp(BitCodeAbbrevOp::Blob));
+    unsigned PPESkippedRangeAbbrev = Stream.EmitAbbrev(std::move(Abbrev));
+
+    Record.clear();
+    Record.push_back(PPD_SKIPPED_RANGES);
+    Stream.EmitRecordWithBlob(PPESkippedRangeAbbrev, Record,
+                              bytes(SerializedSkippedRanges));
   }
 }
 
@@ -5134,9 +5156,13 @@ void ASTWriter::WriteDeclUpdatesBlocks(RecordDataImpl &OffsetsRecord) {
       case UPD_CXX_ADDED_FUNCTION_DEFINITION:
         break;
 
-      case UPD_CXX_INSTANTIATED_STATIC_DATA_MEMBER: {
-        const VarDecl *VD = cast<VarDecl>(D);
+      case UPD_CXX_POINT_OF_INSTANTIATION:
+        // FIXME: Do we need to also save the template specialization kind here?
         Record.AddSourceLocation(Update.getLoc());
+        break;
+
+      case UPD_CXX_ADDED_VAR_DEFINITION: {
+        const VarDecl *VD = cast<VarDecl>(D);
         Record.push_back(VD->isInline());
         Record.push_back(VD->isInlineSpecified());
         if (VD->getInit()) {
@@ -5511,7 +5537,9 @@ void ASTWriter::associateDeclWithFile(const Decl *D, DeclID ID) {
     return;
   // FIXME: ParmVarDecls that are part of a function type of a parameter of
   // a function/objc method, should not have TU as lexical context.
-  if (isa<ParmVarDecl>(D))
+  // TemplateTemplateParmDecls that are part of an alias template, should not
+  // have TU as lexical context.
+  if (isa<ParmVarDecl>(D) || isa<TemplateTemplateParmDecl>(D))
     return;
 
   SourceManager &SM = Context->getSourceManager();
@@ -6255,6 +6283,15 @@ void ASTWriter::CompletedImplicitDefinition(const FunctionDecl *D) {
   DeclUpdates[D].push_back(DeclUpdate(UPD_CXX_ADDED_FUNCTION_DEFINITION));
 }
 
+void ASTWriter::VariableDefinitionInstantiated(const VarDecl *D) {
+  if (Chain && Chain->isProcessingUpdateRecords()) return;
+  assert(!WritingAST && "Already writing the AST!");
+  if (!D->isFromASTFile())
+    return;
+
+  DeclUpdates[D].push_back(DeclUpdate(UPD_CXX_ADDED_VAR_DEFINITION));
+}
+
 void ASTWriter::FunctionDefinitionInstantiated(const FunctionDecl *D) {
   if (Chain && Chain->isProcessingUpdateRecords()) return;
   assert(!WritingAST && "Already writing the AST!");
@@ -6264,7 +6301,7 @@ void ASTWriter::FunctionDefinitionInstantiated(const FunctionDecl *D) {
   DeclUpdates[D].push_back(DeclUpdate(UPD_CXX_ADDED_FUNCTION_DEFINITION));
 }
 
-void ASTWriter::StaticDataMemberInstantiated(const VarDecl *D) {
+void ASTWriter::InstantiationRequested(const ValueDecl *D) {
   if (Chain && Chain->isProcessingUpdateRecords()) return;
   assert(!WritingAST && "Already writing the AST!");
   if (!D->isFromASTFile())
@@ -6272,9 +6309,12 @@ void ASTWriter::StaticDataMemberInstantiated(const VarDecl *D) {
 
   // Since the actual instantiation is delayed, this really means that we need
   // to update the instantiation location.
-  DeclUpdates[D].push_back(
-      DeclUpdate(UPD_CXX_INSTANTIATED_STATIC_DATA_MEMBER,
-       D->getMemberSpecializationInfo()->getPointOfInstantiation()));
+  SourceLocation POI;
+  if (auto *VD = dyn_cast<VarDecl>(D))
+    POI = VD->getPointOfInstantiation();
+  else
+    POI = cast<FunctionDecl>(D)->getPointOfInstantiation();
+  DeclUpdates[D].push_back(DeclUpdate(UPD_CXX_POINT_OF_INSTANTIATION, POI));
 }
 
 void ASTWriter::DefaultArgumentInstantiated(const ParmVarDecl *D) {

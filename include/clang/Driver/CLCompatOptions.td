@@ -145,7 +145,8 @@ def _SLASH_W1 : CLFlag<"W1">, HelpText<"Enable -Wall">, Alias<Wall>;
 def _SLASH_W2 : CLFlag<"W2">, HelpText<"Enable -Wall">, Alias<Wall>;
 def _SLASH_W3 : CLFlag<"W3">, HelpText<"Enable -Wall">, Alias<Wall>;
 def _SLASH_W4 : CLFlag<"W4">, HelpText<"Enable -Wall and -Wextra">, Alias<WCL4>;
-def _SLASH_Wall : CLFlag<"Wall">, HelpText<"Enable -Wall and -Wextra">, Alias<WCL4>;
+def _SLASH_Wall : CLFlag<"Wall">, HelpText<"Enable -Weverything">,
+  Alias<W_Joined>, AliasArgs<["everything"]>;
 def _SLASH_WX : CLFlag<"WX">, HelpText<"Treat warnings as errors">,
   Alias<W_Joined>, AliasArgs<["error"]>;
 def _SLASH_WX_ : CLFlag<"WX-">, HelpText<"Do not treat warnings as errors">,
@@ -153,6 +154,8 @@ def _SLASH_WX_ : CLFlag<"WX-">, HelpText<"Do not treat warnings as errors">,
 def _SLASH_w_flag : CLFlag<"w">, HelpText<"Disable all warnings">, Alias<w>;
 def _SLASH_wd4005 : CLFlag<"wd4005">, Alias<W_Joined>,
   AliasArgs<["no-macro-redefined"]>;
+def _SLASH_wd4018 : CLFlag<"wd4018">, Alias<W_Joined>,
+  AliasArgs<["no-sign-compare"]>;
 def _SLASH_wd4100 : CLFlag<"wd4100">, Alias<W_Joined>,
   AliasArgs<["no-unused-parameter"]>;
 def _SLASH_wd4910 : CLFlag<"wd4910">, Alias<W_Joined>,
@@ -232,6 +235,8 @@ def _SLASH_Fi : CLCompileJoined<"Fi">,
 def _SLASH_Fo : CLCompileJoined<"Fo">,
   HelpText<"Set output object file, or directory (ends in / or \\) (with /c)">,
   MetaVarName<"<file or directory>">;
+def _SLASH_Guard : CLJoined<"guard:">,
+  HelpText<"Enable Control Flow Guard with /guard:cf">;
 def _SLASH_GX : CLFlag<"GX">,
   HelpText<"Enable exception handling">;
 def _SLASH_GX_ : CLFlag<"GX-">,
@@ -321,6 +326,7 @@ def _SLASH_kernel_ : CLIgnoredFlag<"kernel-">;
 def _SLASH_nologo : CLIgnoredFlag<"nologo">;
 def _SLASH_Og : CLIgnoredFlag<"Og">;
 def _SLASH_openmp_ : CLIgnoredFlag<"openmp-">;
+def _SLASH_permissive_ : CLIgnoredFlag<"permissive-">;
 def _SLASH_RTC : CLIgnoredJoined<"RTC">;
 def _SLASH_sdl : CLIgnoredFlag<"sdl">;
 def _SLASH_sdl_ : CLIgnoredFlag<"sdl-">;
@@ -341,6 +347,8 @@ def _SLASH_Zo_ : CLIgnoredFlag<"Zo-">;
 // Unsupported:
 
 def _SLASH_AI : CLJoined<"AI">;
+def _SLASH_Bt : CLFlag<"Bt">;
+def _SLASH_Bt_plus : CLFlag<"Bt+">;
 def _SLASH_clr : CLJoined<"clr">;
 def _SLASH_doc : CLJoined<"doc">;
 def _SLASH_FA_joined : CLJoined<"FA">;
@@ -361,7 +369,6 @@ def _SLASH_GL_ : CLFlag<"GL-">;
 def _SLASH_Gm : CLFlag<"Gm">;
 def _SLASH_Gm_ : CLFlag<"Gm-">;
 def _SLASH_GT : CLFlag<"GT">;
-def _SLASH_Guard : CLJoined<"guard:">;
 def _SLASH_GZ : CLFlag<"GZ">;
 def _SLASH_H : CLFlag<"H">;
 def _SLASH_homeparams : CLFlag<"homeparams">;

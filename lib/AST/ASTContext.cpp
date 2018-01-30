@@ -1378,35 +1378,27 @@ void ASTContext::setInstantiatedFromUnnamedFieldDecl(FieldDecl *Inst,
 
 ASTContext::overridden_cxx_method_iterator
 ASTContext::overridden_methods_begin(const CXXMethodDecl *Method) const {
-  llvm::DenseMap<const CXXMethodDecl *, CXXMethodVector>::const_iterator Pos =
-      OverriddenMethods.find(Method->getCanonicalDecl());
-  if (Pos == OverriddenMethods.end())
-    return nullptr;
-  return Pos->second.begin();
+  return overridden_methods(Method).begin();
 }
 
 ASTContext::overridden_cxx_method_iterator
 ASTContext::overridden_methods_end(const CXXMethodDecl *Method) const {
-  llvm::DenseMap<const CXXMethodDecl *, CXXMethodVector>::const_iterator Pos =
-      OverriddenMethods.find(Method->getCanonicalDecl());
-  if (Pos == OverriddenMethods.end())
-    return nullptr;
-  return Pos->second.end();
+  return overridden_methods(Method).end();
 }
 
 unsigned
 ASTContext::overridden_methods_size(const CXXMethodDecl *Method) const {
-  llvm::DenseMap<const CXXMethodDecl *, CXXMethodVector>::const_iterator Pos =
-      OverriddenMethods.find(Method->getCanonicalDecl());
-  if (Pos == OverriddenMethods.end())
-    return 0;
-  return Pos->second.size();
+  auto Range = overridden_methods(Method);
+  return Range.end() - Range.begin();
 }
 
 ASTContext::overridden_method_range
 ASTContext::overridden_methods(const CXXMethodDecl *Method) const {
-  return overridden_method_range(overridden_methods_begin(Method),
-                                 overridden_methods_end(Method));
+  llvm::DenseMap<const CXXMethodDecl *, CXXMethodVector>::const_iterator Pos =
+      OverriddenMethods.find(Method->getCanonicalDecl());
+  if (Pos == OverriddenMethods.end())
+    return overridden_method_range(nullptr, nullptr);
+  return overridden_method_range(Pos->second.begin(), Pos->second.end());
 }
 
 void ASTContext::addOverriddenMethod(const CXXMethodDecl *Method, 
@@ -1826,7 +1818,8 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
 #define IMAGE_TYPE(ImgType, Id, SingletonId, Access, Suffix) \
     case BuiltinType::Id:
 #include "clang/Basic/OpenCLImageTypes.def"
-      AS = getTargetAddressSpace(Target->getOpenCLTypeAddrSpace(T));
+      AS = getTargetAddressSpace(
+          Target->getOpenCLTypeAddrSpace(getOpenCLTypeKind(T)));
       Width = Target->getPointerWidth(AS);
       Align = Target->getPointerAlign(AS);
       break;
@@ -1856,7 +1849,9 @@ TypeInfo ASTContext::getTypeInfoImpl(const Type *T) const {
     break;
   case Type::MemberPointer: {
     const MemberPointerType *MPT = cast<MemberPointerType>(T);
-    std::tie(Width, Align) = ABI->getMemberPointerWidthAndAlign(MPT);
+    CXXABI::MemberPointerInfo MPI = ABI->getMemberPointerInfo(MPT);
+    Width = MPI.Width;
+    Align = MPI.Align;
     break;
   }
   case Type::Complex: {
@@ -2136,6 +2131,171 @@ void ASTContext::CollectInheritedProtocols(const Decl *CDecl,
     for (auto *Proto : OP->protocols())
       CollectInheritedProtocols(Proto, Protocols);
   }
+}
+
+static bool unionHasUniqueObjectRepresentations(const ASTContext &Context,
+                                                const RecordDecl *RD) {
+  assert(RD->isUnion() && "Must be union type");
+  CharUnits UnionSize = Context.getTypeSizeInChars(RD->getTypeForDecl());
+
+  for (const auto *Field : RD->fields()) {
+    if (!Context.hasUniqueObjectRepresentations(Field->getType()))
+      return false;
+    CharUnits FieldSize = Context.getTypeSizeInChars(Field->getType());
+    if (FieldSize != UnionSize)
+      return false;
+  }
+  return true;
+}
+
+static bool isStructEmpty(QualType Ty) {
+  const RecordDecl *RD = Ty->castAs<RecordType>()->getDecl();
+
+  if (!RD->field_empty())
+    return false;
+
+  if (const auto *ClassDecl = dyn_cast<CXXRecordDecl>(RD))
+    return ClassDecl->isEmpty();
+
+  return true;
+}
+
+static llvm::Optional<int64_t>
+structHasUniqueObjectRepresentations(const ASTContext &Context,
+                                     const RecordDecl *RD) {
+  assert(!RD->isUnion() && "Must be struct/class type");
+  const auto &Layout = Context.getASTRecordLayout(RD);
+
+  int64_t CurOffsetInBits = 0;
+  if (const auto *ClassDecl = dyn_cast<CXXRecordDecl>(RD)) {
+    if (ClassDecl->isDynamicClass())
+      return llvm::None;
+
+    SmallVector<std::pair<QualType, int64_t>, 4> Bases;
+    for (const auto Base : ClassDecl->bases()) {
+      // Empty types can be inherited from, and non-empty types can potentially
+      // have tail padding, so just make sure there isn't an error.
+      if (!isStructEmpty(Base.getType())) {
+        llvm::Optional<int64_t> Size = structHasUniqueObjectRepresentations(
+            Context, Base.getType()->getAs<RecordType>()->getDecl());
+        if (!Size)
+          return llvm::None;
+        Bases.emplace_back(Base.getType(), Size.getValue());
+      }
+    }
+
+    std::sort(
+        Bases.begin(), Bases.end(), [&](const std::pair<QualType, int64_t> &L,
+                                        const std::pair<QualType, int64_t> &R) {
+          return Layout.getBaseClassOffset(L.first->getAsCXXRecordDecl()) <
+                 Layout.getBaseClassOffset(R.first->getAsCXXRecordDecl());
+        });
+
+    for (const auto Base : Bases) {
+      int64_t BaseOffset = Context.toBits(
+          Layout.getBaseClassOffset(Base.first->getAsCXXRecordDecl()));
+      int64_t BaseSize = Base.second;
+      if (BaseOffset != CurOffsetInBits)
+        return llvm::None;
+      CurOffsetInBits = BaseOffset + BaseSize;
+    }
+  }
+
+  for (const auto *Field : RD->fields()) {
+    if (!Field->getType()->isReferenceType() &&
+        !Context.hasUniqueObjectRepresentations(Field->getType()))
+      return llvm::None;
+
+    int64_t FieldSizeInBits =
+        Context.toBits(Context.getTypeSizeInChars(Field->getType()));
+    if (Field->isBitField()) {
+      int64_t BitfieldSize = Field->getBitWidthValue(Context);
+
+      if (BitfieldSize > FieldSizeInBits)
+        return llvm::None;
+      FieldSizeInBits = BitfieldSize;
+    }
+
+    int64_t FieldOffsetInBits = Context.getFieldOffset(Field);
+
+    if (FieldOffsetInBits != CurOffsetInBits)
+      return llvm::None;
+
+    CurOffsetInBits = FieldSizeInBits + FieldOffsetInBits;
+  }
+
+  return CurOffsetInBits;
+}
+
+bool ASTContext::hasUniqueObjectRepresentations(QualType Ty) const {
+  // C++17 [meta.unary.prop]:
+  //   The predicate condition for a template specialization
+  //   has_unique_object_representations<T> shall be
+  //   satisfied if and only if:
+  //     (9.1) - T is trivially copyable, and
+  //     (9.2) - any two objects of type T with the same value have the same
+  //     object representation, where two objects
+  //   of array or non-union class type are considered to have the same value
+  //   if their respective sequences of
+  //   direct subobjects have the same values, and two objects of union type
+  //   are considered to have the same
+  //   value if they have the same active member and the corresponding members
+  //   have the same value.
+  //   The set of scalar types for which this condition holds is
+  //   implementation-defined. [ Note: If a type has padding
+  //   bits, the condition does not hold; otherwise, the condition holds true
+  //   for unsigned integral types. -- end note ]
+  assert(!Ty.isNull() && "Null QualType sent to unique object rep check");
+
+  // Arrays are unique only if their element type is unique.
+  if (Ty->isArrayType())
+    return hasUniqueObjectRepresentations(getBaseElementType(Ty));
+
+  // (9.1) - T is trivially copyable...
+  if (!Ty.isTriviallyCopyableType(*this))
+    return false;
+
+  // All integrals and enums are unique.
+  if (Ty->isIntegralOrEnumerationType())
+    return true;
+
+  // All other pointers are unique.
+  if (Ty->isPointerType())
+    return true;
+
+  if (Ty->isMemberPointerType()) {
+    const MemberPointerType *MPT = Ty->getAs<MemberPointerType>();
+    return !ABI->getMemberPointerInfo(MPT).HasPadding;
+  }
+
+  if (Ty->isRecordType()) {
+    const RecordDecl *Record = Ty->getAs<RecordType>()->getDecl();
+
+    if (Record->isInvalidDecl())
+      return false;
+
+    if (Record->isUnion())
+      return unionHasUniqueObjectRepresentations(*this, Record);
+
+    Optional<int64_t> StructSize =
+        structHasUniqueObjectRepresentations(*this, Record);
+
+    return StructSize &&
+           StructSize.getValue() == static_cast<int64_t>(getTypeSize(Ty));
+  }
+
+  // FIXME: More cases to handle here (list by rsmith):
+  // vectors (careful about, eg, vector of 3 foo)
+  // _Complex int and friends
+  // _Atomic T
+  // Obj-C block pointers
+  // Obj-C object pointers
+  // and perhaps OpenCL's various builtin types (pipe, sampler_t, event_t,
+  // clk_event_t, queue_t, reserve_id_t)
+  // There're also Obj-C class types and the Obj-C selector type, but I think it
+  // makes sense for those to return false here.
+
+  return false;
 }
 
 unsigned ASTContext::CountNonClassIvars(const ObjCInterfaceDecl *OI) const {
@@ -2422,26 +2582,24 @@ void ASTContext::adjustDeducedFunctionResultType(FunctionDecl *FD,
 /// specified exception specification. Type sugar that can be present on a
 /// declaration of a function with an exception specification is permitted
 /// and preserved. Other type sugar (for instance, typedefs) is not.
-static QualType getFunctionTypeWithExceptionSpec(
-    ASTContext &Context, QualType Orig,
-    const FunctionProtoType::ExceptionSpecInfo &ESI) {
+QualType ASTContext::getFunctionTypeWithExceptionSpec(
+    QualType Orig, const FunctionProtoType::ExceptionSpecInfo &ESI) {
   // Might have some parens.
   if (auto *PT = dyn_cast<ParenType>(Orig))
-    return Context.getParenType(
-        getFunctionTypeWithExceptionSpec(Context, PT->getInnerType(), ESI));
+    return getParenType(
+        getFunctionTypeWithExceptionSpec(PT->getInnerType(), ESI));
 
   // Might have a calling-convention attribute.
   if (auto *AT = dyn_cast<AttributedType>(Orig))
-    return Context.getAttributedType(
+    return getAttributedType(
         AT->getAttrKind(),
-        getFunctionTypeWithExceptionSpec(Context, AT->getModifiedType(), ESI),
-        getFunctionTypeWithExceptionSpec(Context, AT->getEquivalentType(),
-                                         ESI));
+        getFunctionTypeWithExceptionSpec(AT->getModifiedType(), ESI),
+        getFunctionTypeWithExceptionSpec(AT->getEquivalentType(), ESI));
 
   // Anything else must be a function type. Rebuild it with the new exception
   // specification.
   const FunctionProtoType *Proto = cast<FunctionProtoType>(Orig);
-  return Context.getFunctionType(
+  return getFunctionType(
       Proto->getReturnType(), Proto->getParamTypes(),
       Proto->getExtProtoInfo().withExceptionSpec(ESI));
 }
@@ -2449,9 +2607,9 @@ static QualType getFunctionTypeWithExceptionSpec(
 bool ASTContext::hasSameFunctionTypeIgnoringExceptionSpec(QualType T,
                                                           QualType U) {
   return hasSameType(T, U) ||
-         (getLangOpts().CPlusPlus1z &&
-          hasSameType(getFunctionTypeWithExceptionSpec(*this, T, EST_None),
-                      getFunctionTypeWithExceptionSpec(*this, U, EST_None)));
+         (getLangOpts().CPlusPlus17 &&
+          hasSameType(getFunctionTypeWithExceptionSpec(T, EST_None),
+                      getFunctionTypeWithExceptionSpec(U, EST_None)));
 }
 
 void ASTContext::adjustExceptionSpec(
@@ -2459,7 +2617,7 @@ void ASTContext::adjustExceptionSpec(
     bool AsWritten) {
   // Update the type.
   QualType Updated =
-      getFunctionTypeWithExceptionSpec(*this, FD->getType(), ESI);
+      getFunctionTypeWithExceptionSpec(FD->getType(), ESI);
   FD->setType(Updated);
 
   if (!AsWritten)
@@ -2470,7 +2628,7 @@ void ASTContext::adjustExceptionSpec(
     // If the type and the type-as-written differ, we may need to update
     // the type-as-written too.
     if (TSInfo->getType() != FD->getType())
-      Updated = getFunctionTypeWithExceptionSpec(*this, TSInfo->getType(), ESI);
+      Updated = getFunctionTypeWithExceptionSpec(TSInfo->getType(), ESI);
 
     // FIXME: When we get proper type location information for exceptions,
     // we'll also have to rebuild the TypeSourceInfo. For now, we just patch
@@ -3313,7 +3471,7 @@ QualType ASTContext::getFunctionTypeInternal(
     Unique = true;
   }
 
-  bool NoexceptInType = getLangOpts().CPlusPlus1z;
+  bool NoexceptInType = getLangOpts().CPlusPlus17;
   bool IsCanonicalExceptionSpec =
       isCanonicalExceptionSpecification(EPI.ExceptionSpec, NoexceptInType);
 
@@ -5556,6 +5714,46 @@ QualType ASTContext::getBlockDescriptorExtendedType() const {
   return getTagDeclType(BlockDescriptorExtendedType);
 }
 
+TargetInfo::OpenCLTypeKind ASTContext::getOpenCLTypeKind(const Type *T) const {
+  auto BT = dyn_cast<BuiltinType>(T);
+
+  if (!BT) {
+    if (isa<PipeType>(T))
+      return TargetInfo::OCLTK_Pipe;
+
+    return TargetInfo::OCLTK_Default;
+  }
+
+  switch (BT->getKind()) {
+#define IMAGE_TYPE(ImgType, Id, SingletonId, Access, Suffix)                   \
+  case BuiltinType::Id:                                                        \
+    return TargetInfo::OCLTK_Image;
+#include "clang/Basic/OpenCLImageTypes.def"
+
+  case BuiltinType::OCLClkEvent:
+    return TargetInfo::OCLTK_ClkEvent;
+
+  case BuiltinType::OCLEvent:
+    return TargetInfo::OCLTK_Event;
+
+  case BuiltinType::OCLQueue:
+    return TargetInfo::OCLTK_Queue;
+
+  case BuiltinType::OCLReserveID:
+    return TargetInfo::OCLTK_ReserveID;
+
+  case BuiltinType::OCLSampler:
+    return TargetInfo::OCLTK_Sampler;
+
+  default:
+    return TargetInfo::OCLTK_Default;
+  }
+}
+
+LangAS ASTContext::getOpenCLTypeAddrSpace(const Type *T) const {
+  return Target->getOpenCLTypeAddrSpace(getOpenCLTypeKind(T));
+}
+
 /// BlockRequiresCopying - Returns true if byref variable "D" of type "Ty"
 /// requires copy/dispose. Note that this must match the logic
 /// in buildByrefHelpers.
@@ -6274,9 +6472,8 @@ void ASTContext::getObjCEncodingForTypeImpl(QualType T, std::string& S,
           = dyn_cast<ClassTemplateSpecializationDecl>(RDecl)) {
         const TemplateArgumentList &TemplateArgs = Spec->getTemplateArgs();
         llvm::raw_string_ostream OS(S);
-        TemplateSpecializationType::PrintTemplateArgumentList(OS,
-                                            TemplateArgs.asArray(),
-                                            (*this).getPrintingPolicy());
+        printTemplateArgumentList(OS, TemplateArgs.asArray(),
+                                  getPrintingPolicy());
       }
     } else {
       S += '?';
@@ -8732,10 +8929,12 @@ static QualType DecodeTypeFromStr(const char *&Str, const ASTContext &Context,
     Type = Context.FloatTy;
     break;
   case 'd':
-    assert(HowLong < 2 && !Signed && !Unsigned &&
+    assert(HowLong < 3 && !Signed && !Unsigned &&
            "Bad modifiers used with 'd'!");
-    if (HowLong)
+    if (HowLong == 1)
       Type = Context.LongDoubleTy;
+    else if (HowLong == 2)
+      Type = Context.Float128Ty;
     else
       Type = Context.DoubleTy;
     break;
@@ -9282,6 +9481,23 @@ bool ASTContext::DeclMustBeEmitted(const Decl *D) {
           return true;
 
   return false;
+}
+
+void ASTContext::forEachMultiversionedFunctionVersion(
+    const FunctionDecl *FD,
+    llvm::function_ref<void(const FunctionDecl *)> Pred) const {
+  assert(FD->isMultiVersion() && "Only valid for multiversioned functions");
+  llvm::SmallDenseSet<const FunctionDecl*, 4> SeenDecls;
+  FD = FD->getCanonicalDecl();
+  for (auto *CurDecl :
+       FD->getDeclContext()->getRedeclContext()->lookup(FD->getDeclName())) {
+    FunctionDecl *CurFD = CurDecl->getAsFunction()->getCanonicalDecl();
+    if (CurFD && hasSameType(CurFD->getType(), FD->getType()) &&
+        std::end(SeenDecls) == llvm::find(SeenDecls, CurFD)) {
+      SeenDecls.insert(CurFD);
+      Pred(CurFD);
+    }
+  }
 }
 
 CallingConv ASTContext::getDefaultCallingConvention(bool IsVariadic,

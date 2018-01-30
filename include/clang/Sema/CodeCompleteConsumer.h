@@ -18,6 +18,7 @@
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/Type.h"
 #include "clang/Sema/CodeCompleteOptions.h"
+#include "clang/Sema/DeclSpec.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -267,6 +268,8 @@ public:
     CCC_Recovery
   };
 
+  using VisitedContextSet = llvm::SmallPtrSet<DeclContext*, 8>;
+
 private:
   enum Kind Kind;
 
@@ -279,6 +282,14 @@ private:
 
   /// \brief The identifiers for Objective-C selector parts.
   ArrayRef<IdentifierInfo *> SelIdents;
+
+  /// \brief The scope specifier that comes before the completion token e.g.
+  /// "a::b::"
+  llvm::Optional<CXXScopeSpec> ScopeSpecifier;
+
+  /// \brief A set of declaration contexts visited by Sema when doing lookup for
+  /// code completion.
+  VisitedContextSet VisitedContexts;
 
 public:
   /// \brief Construct a new code-completion context of the given kind.
@@ -315,8 +326,30 @@ public:
   /// \brief Determines whether we want C++ constructors as results within this
   /// context.
   bool wantConstructorResults() const;
-};
 
+  /// \brief Sets the scope specifier that comes before the completion token.
+  /// This is expected to be set in code completions on qualfied specifiers
+  /// (e.g. "a::b::").
+  void setCXXScopeSpecifier(CXXScopeSpec SS) {
+    this->ScopeSpecifier = std::move(SS);
+  }
+
+  /// \brief Adds a visited context.
+  void addVisitedContext(DeclContext* Ctx) {
+    VisitedContexts.insert(Ctx);
+  }
+
+  /// \brief Retrieves all visited contexts.
+  const VisitedContextSet &getVisitedContexts() const {
+    return VisitedContexts;
+  }
+
+  llvm::Optional<const CXXScopeSpec *> getCXXScopeSpecifier() {
+    if (ScopeSpecifier)
+      return ScopeSpecifier.getPointer();
+    return llvm::None;
+  }
+};
 
 /// \brief A "string" used to describe how code completion can
 /// be performed for an entity.
@@ -902,14 +935,25 @@ public:
   }
 
   /// \brief Whether to include global (top-level) declaration results.
-  bool includeGlobals() const {
-    return CodeCompleteOpts.IncludeGlobals;
+  bool includeGlobals() const { return CodeCompleteOpts.IncludeGlobals; }
+
+  /// \brief Whether to include declarations in namespace contexts (including
+  /// the global namespace). If this is false, `includeGlobals()` will be
+  /// ignored.
+  bool includeNamespaceLevelDecls() const {
+    return CodeCompleteOpts.IncludeNamespaceLevelDecls;
   }
 
   /// \brief Whether to include brief documentation comments within the set of
   /// code completions returned.
   bool includeBriefComments() const {
     return CodeCompleteOpts.IncludeBriefComments;
+  }
+
+  /// \brief Hint whether to load data from the external AST in order to provide
+  /// full results. If false, declarations from the preamble may be omitted.
+  bool loadExternal() const {
+    return CodeCompleteOpts.LoadExternal;
   }
 
   /// \brief Determine whether the output of this consumer is binary.
