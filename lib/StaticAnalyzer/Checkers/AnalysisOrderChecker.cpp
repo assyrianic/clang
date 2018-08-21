@@ -16,6 +16,7 @@
 
 #include "ClangSACheckers.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/Analysis/CFGStmtMap.h"
 #include "clang/StaticAnalyzer/Core/Checker.h"
 #include "clang/StaticAnalyzer/Core/CheckerManager.h"
 #include "clang/StaticAnalyzer/Core/PathSensitive/CallEvent.h"
@@ -33,11 +34,16 @@ class AnalysisOrderChecker
                      check::PostStmt<ArraySubscriptExpr>,
                      check::PreStmt<CXXNewExpr>,
                      check::PostStmt<CXXNewExpr>,
+                     check::PreStmt<OffsetOfExpr>,
+                     check::PostStmt<OffsetOfExpr>,
                      check::PreCall,
                      check::PostCall,
+                     check::EndFunction,
                      check::NewAllocator,
                      check::Bind,
-                     check::RegionChanges> {
+                     check::RegionChanges,
+                     check::LiveSymbols> {
+
   bool isCallbackEnabled(AnalyzerOptions &Opts, StringRef CallbackName) const {
     return Opts.getBooleanOption("*", false, this) ||
         Opts.getBooleanOption(CallbackName, false, this);
@@ -89,6 +95,16 @@ public:
       llvm::errs() << "PostStmt<CXXNewExpr>\n";
   }
 
+  void checkPreStmt(const OffsetOfExpr *OOE, CheckerContext &C) const {
+    if (isCallbackEnabled(C, "PreStmtOffsetOfExpr"))
+      llvm::errs() << "PreStmt<OffsetOfExpr>\n";
+  }
+
+  void checkPostStmt(const OffsetOfExpr *OOE, CheckerContext &C) const {
+    if (isCallbackEnabled(C, "PostStmtOffsetOfExpr"))
+      llvm::errs() << "PostStmt<OffsetOfExpr>\n";
+  }
+
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const {
     if (isCallbackEnabled(C, "PreCall")) {
       llvm::errs() << "PreCall";
@@ -107,6 +123,23 @@ public:
     }
   }
 
+  void checkEndFunction(const ReturnStmt *S, CheckerContext &C) const {
+    if (isCallbackEnabled(C, "EndFunction")) {
+      llvm::errs() << "EndFunction\nReturnStmt: " << (S ? "yes" : "no") << "\n";
+      if (!S)
+        return;
+
+      llvm::errs() << "CFGElement: ";
+      CFGStmtMap *Map = C.getCurrentAnalysisDeclContext()->getCFGStmtMap();
+      CFGElement LastElement = Map->getBlock(S)->back();
+
+      if (LastElement.getAs<CFGStmt>())
+        llvm::errs() << "CFGStmt\n";
+      else if (LastElement.getAs<CFGAutomaticObjDtor>())
+        llvm::errs() << "CFGAutomaticObjDtor\n";
+    }
+  }
+
   void checkNewAllocator(const CXXNewExpr *CNE, SVal Target,
                          CheckerContext &C) const {
     if (isCallbackEnabled(C, "NewAllocator"))
@@ -116,6 +149,11 @@ public:
   void checkBind(SVal Loc, SVal Val, const Stmt *S, CheckerContext &C) const {
     if (isCallbackEnabled(C, "Bind"))
       llvm::errs() << "Bind\n";
+  }
+
+  void checkLiveSymbols(ProgramStateRef State, SymbolReaper &SymReaper) const {
+    if (isCallbackEnabled(State, "LiveSymbols"))
+      llvm::errs() << "LiveSymbols\n";
   }
 
   ProgramStateRef
